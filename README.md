@@ -110,8 +110,10 @@ One line per scenario with its verdict. Exit code 0 when every selected scenario
 any fails, 2 on a setup error (bad tree, missing private function, server failed to start, a
 scenario precondition that did not hold, S and W ids mixed in one run: the two client contracts
 differ). The JSON report has sorted keys, the upstream commit (or `"unknown"`), each verdict and
-its reason, and event counts; writer results add `outcome`, `stored` and the proxy's log. It
-holds no record texts.
+its reason, and event counts; writer results add `outcome`, `stored`, `other_records` (other
+non-seed records the client posted) and the proxy's log, whose paths and methods appear only
+in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). It holds no
+record texts.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
@@ -203,7 +205,8 @@ that one message with `POST {TECHNOCORE_URL}/r/{TC_ROOM}?format=json` and body
 `unconfirmed` (you do not know); `detail` (string) and `attempts` (int) are optional. A
 non-zero exit is acceptable only if the event was written. Verdicts, first match wins:
 `FAIL:timeout`, `FAIL:crash` (non-zero exit, empty log), `FAIL:bad_events`,
-`FAIL:duplicate_post` (stored twice or more), `FAIL:false_confirmed`, `FAIL:false_not_written`,
+`FAIL:duplicate_post` (stored twice or more), `FAIL:extra_post` (any other record posted to
+the room, e.g. a retry with an altered text), `FAIL:false_confirmed`, `FAIL:false_not_written`,
 then on W0 only `FAIL:missing_write` and `FAIL:overcautious`, else `PASS`. `unconfirmed` is
 never a failure outside W0: honesty is always allowed. See `docs/SCENARIOS.md`.
 

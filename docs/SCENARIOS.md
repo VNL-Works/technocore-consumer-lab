@@ -191,17 +191,28 @@ connection waiting in the listen backlog; at most 10 s), then counts the records
 whose `text` equals the write text, with `store.read_messages(root, room, limit=MAX_LIMIT)`
 in-process, never through the proxy. Upstream trims the text, so a copy posted with extra
 surrounding whitespace still counts; a retry that **alters** the text (a suffix, a counter) is a
-different message and is not counted as a second copy. The seed never counts and must still be
-there exactly once. After the proxy has stopped, the kit waits for it once more and requires
-that no request arrived after its snapshot of the log. The proxy's log (method, path without query, action, forwarded, origin status; no
-bodies, no texts) is the truth about forwarding, and the kit asserts each scenario's
+different message and is not counted as a second copy. The same read gives `other_records`:
+every non-seed record in the room whose text is not the write text (an altered retry, any other
+post); a read that returns `MAX_LIMIT` records or more is a setup error, as it may be cut off.
+The seed never counts and must still be there exactly once. After the proxy has stopped, the kit waits for it once more and requires
+that no request arrived after its snapshot of the log. The proxy holds a connection that
+sends no request for up to 15 s (`CLIENT_READ_TIMEOUT`), longer than the 10 s idle wait, so a
+process that escaped the group kill (for example via `setsid`) and holds such a connection
+turns the run into a setup error (exit 2), not a verdict. The proxy's log (method, path
+without query, action, forwarded, origin status; no bodies, no texts) is the truth about
+forwarding, and the kit asserts each scenario's
 precondition from it: in W1..W4 and W7 the first POST was forwarded and upstream answered 200
 (and the write is stored); in W5 and W6 it was not forwarded. A broken precondition is a setup
 error (exit 2), not a verdict. In W1..W7 the kit also fails closed when the message is
 stored but no room POST in the log got the scenario's fault: a write that reached upstream
 without the fault proves nothing. Only when no POST for the room reached the proxy and nothing
 is stored (a client that crashed first, say) is there nothing to check, and the cycle is judged
-as is. A client that deletes or empties its event log is judged on the empty log.
+as is. A client that deletes or empties its event log is judged on the empty log. The report
+shows that log reduced: a path only as upstream routes it when that is `/r/{room}`,
+`/r/{room}/export` or `/rooms`, else `<other>`; a method only when it is a standard one, else
+`<other>`; `raw_path_differs` says whether the raw path was different. The kit is a test bench
+for clients that follow the contract, not a sandbox: a process outside the client's process
+group, or one that finds upstream's loopback port, can act around the kit.
 
 **Determinism.** Every "after write" action reads upstream's whole reply before it misbehaves,
 so the write has committed before the client sees anything; no step waits on a timer except
@@ -298,17 +309,20 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
 
 `consumer_lab.writer_judge.judge_write`; the first rule that matches wins:
 
-1. `FAIL:timeout`: the cycle ran over 30 s (the process group is killed).
+1. `FAIL:timeout`: the cycle ran over 30 s. (The client's process group is killed after
+   every cycle, not only on timeout.)
 2. `FAIL:crash`: a non-zero exit with an empty event log.
 3. `FAIL:bad_events`: the log changed after the cycle ended (the kit judges the log as it
    stood when the client exited, and compares it again after the proxy went idle), malformed
    JSONL, no `write` event for `TC_WRITE_ID`, more than one, an unknown outcome, any other
    event kind or id, a non-string `detail` or a non-integer `attempts`.
 4. `FAIL:duplicate_post`: stored 2 or more, whatever the client claims.
-5. `FAIL:false_confirmed`: `confirmed`, stored 0.
-6. `FAIL:false_not_written`: `not_written`, stored 1 or more.
-7. W0 only: `FAIL:missing_write` (stored 0), then `FAIL:overcautious` (not `confirmed`).
-8. `PASS`, with the outcome and the count, e.g. `W5: unconfirmed, stored 0`.
+5. `FAIL:extra_post`: `other_records` 1 or more: the client posted some other record to the
+   room (an altered retry, say), whatever it claims.
+6. `FAIL:false_confirmed`: `confirmed`, stored 0.
+7. `FAIL:false_not_written`: `not_written`, stored 1 or more.
+8. W0 only: `FAIL:missing_write` (stored 0), then `FAIL:overcautious` (not `confirmed`).
+9. `PASS`, with the outcome and the count, e.g. `W5: unconfirmed, stored 0`.
 
 A non-zero exit with a valid write event is acceptable. **`unconfirmed` is never penalised
 outside W0**: when a client cannot know, saying so is the correct answer, and a kit that
