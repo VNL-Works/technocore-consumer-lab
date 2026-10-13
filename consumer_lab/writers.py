@@ -24,7 +24,6 @@ from consumer_lab.scenarios import (
     _NO_PROXY,
     CYCLE_TIMEOUT,
     NotDeterministic,
-    _line_count,
     client_argv,
     client_env,
     run_client,
@@ -150,7 +149,7 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
         )
         exit_code, timed_out = run_client(argv, env, stderr_path, CYCLE_TIMEOUT)
         at_end = events_path.read_bytes()
-        n_lines = _line_count(events_path)
+        n_lines = len(at_end.splitlines())
         # A forward still running would be missed by the count below: wait for the proxy.
         _require(proxy.wait_idle(IDLE_TIMEOUT), room, f"proxy idle within {IDLE_TIMEOUT:g}s of the cycle")
         log = [dict(e) for e in proxy.log]

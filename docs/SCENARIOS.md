@@ -225,7 +225,9 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
 - **Expected.** Stored 1; `confirmed` or `unconfirmed`.
 - **Why.** Issue #982: the write landed and the answer never came. The 10 s silence exceeds
   `TC_WRITE_TIMEOUT` (3 s). A client that retries on timeout stores a second copy. The stalled
-  handler ends at 10 s (or at once when the kit stops the proxy); the kit waits for it before
+  handler ends at 10 s, or as soon as the client hangs up (nobody is left to be silent to; a
+  client that posts and closes at once must not keep the proxy busy past the cycle), or when
+  the kit stops the proxy; the kit waits for it before
   counting, so the cycle stays well under 30 s and nothing in flight is missed.
 
 ## W4 `truncated-after-write`

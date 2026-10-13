@@ -300,7 +300,7 @@ class FaultProxy:
             elif action.kind == "redirect_after_write":
                 _send_redirect(sock, action.code, self.plan.room)
             elif action.kind == "stall_after_write":
-                self._stopping.wait(action.seconds)
+                self._stall(sock, action.seconds)
             elif action.kind == "truncate_after_write":
                 _send_truncated(sock, status, reason, resp_headers, resp_body)
         except OSError:
@@ -310,6 +310,26 @@ class FaultProxy:
                 rfile.close()
             except OSError:
                 pass
+
+    def _stall(self, sock: socket.socket, seconds: float) -> None:
+        """Send nothing for `seconds`, then return (the caller closes).
+
+        Ends early when `.stop()` is called, or when the client has hung up: once nobody is
+        left to be silent to, the silence is over. Without that, a client that posts and
+        closes at once (the forward starting after it exited) would keep the handler busy up
+        to `seconds` past the cycle, racing the kit's `wait_idle`.
+        """
+        deadline = time.monotonic() + seconds
+        while not self._stopping.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            try:
+                readable, _, _ = select.select([sock], [], [], min(left, 0.1))
+                if readable and not sock.recv(4096):
+                    return  # EOF: the client hung up
+            except OSError:
+                return  # reset by the client: also gone
 
     def _log_entry(self, method: str, path: str, action: str) -> dict:
         entry = {

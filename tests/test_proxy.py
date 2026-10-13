@@ -177,6 +177,20 @@ class ProxyActions(unittest.TestCase):
         t.join(5)
         self.assertLess(time.monotonic() - t0, 3.0)
 
+    def test_stall_ends_when_the_client_hangs_up(self):
+        # A client that sends and closes at once: the forward may start after it is gone, and
+        # the stall must not keep the proxy busy for its full length after that.
+        proxy = self.start(first_post=P.stall_after_write(30))
+        s = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+        s.sendall(f"POST /r/{ROOM}?format=json HTTP/1.1\r\nHost: x\r\n"
+                  f"Content-Length: {len(BODY)}\r\n\r\n".encode() + BODY)
+        s.close()
+        t0 = time.monotonic()
+        self.assertTrue(proxy.wait_idle(5))
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertEqual(len(self.origin.posts()), 1)  # forwarded all the same
+        self.assertEqual((proxy.log[0]["forwarded"], proxy.log[0]["origin_status"]), (True, 200))
+
     def test_truncate_after_write(self):
         proxy = self.start(first_post=P.truncate_after_write())
         data, exc, _ = self.post(proxy)
