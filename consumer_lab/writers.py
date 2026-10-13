@@ -114,6 +114,53 @@ def _require(cond: bool, room: str, what: str) -> None:
         raise NotDeterministic(f"{room}: precondition failed: {what}")
 
 
+def _read_events(path: Path) -> bytes:
+    """The event log's bytes; a log the client deleted or made unreadable reads as empty, so
+    the client's fault is judged (crash / bad_events), not reported as the kit's."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _room_posts(log: list[dict], room: str) -> list[dict]:
+    """Proxy log entries for POSTs to the room, matched as upstream routes the path."""
+    want = f"/r/{room}"
+    return [e for e in log if e["method"] == "POST" and P.room_request_path(e["path_without_query"]) == want]
+
+
+def check_fault_applied(scenario: WriterScenario, log: list[dict], stored: int) -> None:
+    """The preconditions on the first POST, from the proxy log (raises NotDeterministic).
+
+    - W1..W7: once the message is stored, the scenario's fault must have been applied to a
+      room POST. A write that reached upstream without the fault proves nothing (fail closed).
+    - W1..W4, W7: if a room POST arrived, the first one was forwarded, answered 200, and stored.
+    - W5, W6: if a room POST arrived, the first one was not forwarded.
+    With no room POST and nothing stored (a client that crashed first), there is nothing to
+    check: the cycle is judged as is.
+    """
+    room = scenario.room
+    posts = _room_posts(log, room)
+    first_post = posts[0] if posts else None
+    if scenario.first_post_forwarded is not None and stored >= 1:
+        label = scenario.plan.first_post.label
+        _require(
+            any(e["action"] == label for e in posts),
+            room,
+            f"the message was stored without passing the scenario's fault ({label})",
+        )
+    if first_post is not None and scenario.first_post_forwarded is True:
+        _require(
+            first_post["forwarded"] and first_post["origin_status"] == 200,
+            room,
+            f"the first POST was forwarded and answered 200 (forwarded={first_post['forwarded']}, "
+            f"origin_status={first_post['origin_status']})",
+        )
+        _require(stored >= 1, room, "the forwarded first POST is stored")
+    if first_post is not None and scenario.first_post_forwarded is False:
+        _require(not first_post["forwarded"], room, "the first POST was not forwarded")
+
+
 def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir: Path) -> WriterRun:
     """Seed, run one client cycle through the proxy, wait for the proxy, compute the truth."""
     argv = client_argv(client_cmd)
@@ -148,35 +195,27 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
             }
         )
         exit_code, timed_out = run_client(argv, env, stderr_path, CYCLE_TIMEOUT)
-        at_end = events_path.read_bytes()
+        at_end = _read_events(events_path)
         n_lines = len(at_end.splitlines())
         # A forward still running would be missed by the count below: wait for the proxy.
         _require(proxy.wait_idle(IDLE_TIMEOUT), room, f"proxy idle within {IDLE_TIMEOUT:g}s of the cycle")
         log = [dict(e) for e in proxy.log]
     finally:
         proxy.stop()
+    # A connection accepted between the wait above and the shutdown could still forward a
+    # write: wait again (the counter outlives the listener) and require that nothing new came.
+    _require(proxy.wait_idle(IDLE_TIMEOUT), room, "proxy idle after it stopped")
+    _require(len(proxy.log) == len(log), room, "no request reached the proxy after the cycle's snapshot")
 
     texts = _texts(up, room)
     _require(texts.count(SEED_TEXT) == 1, room, "the seed is stored exactly once")
     stored = texts.count(text)
+    check_fault_applied(scenario, log, stored)
 
-    first_post = next(
-        (e for e in log if e["method"] == "POST" and e["path_without_query"] == f"/r/{room}"), None
-    )
-    if first_post is not None and scenario.first_post_forwarded is True:
-        _require(
-            first_post["forwarded"] and first_post["origin_status"] == 200,
-            room,
-            f"the first POST was forwarded and answered 200 (forwarded={first_post['forwarded']}, "
-            f"origin_status={first_post['origin_status']})",
-        )
-        _require(stored >= 1, room, "the forwarded first POST is stored")
-    if first_post is not None and scenario.first_post_forwarded is False:
-        _require(not first_post["forwarded"], room, "the first POST was not forwarded")
-
-    # The log as it stood when the cycle ended is what gets judged; any change since (a
-    # helper the client left behind, say) makes the log untrustworthy.
-    intact = events_path.read_bytes() == at_end
+    # The log as it stood when the cycle ended is what gets judged. A change made after that
+    # and before this second read (a helper the client left behind, say) makes the log
+    # untrustworthy; later changes are not seen, but they cannot alter the verdict either.
+    intact = _read_events(events_path) == at_end
     cycle = Cycle(exit_code, timed_out, 0, n_lines, log_intact=intact)
     lines = at_end.decode("utf-8", errors="replace").splitlines()
     event, _ = parse_write_events(lines, write_id)

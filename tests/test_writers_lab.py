@@ -224,6 +224,103 @@ class WriterKit(unittest.TestCase):
         code, _, output = run_kit(ref("careful_writer.py"), "W8")
         self.assertEqual(code, 2, output)
 
+ENCODED_NAIVE = r'''
+import json, os, urllib.request
+# The naive writer's logic (urllib, retry any error up to 2 more times, trust a 2xx), but the
+# room is written percent-encoded ("lab%2Dw2"): upstream routes it to the same room, so the
+# proxy must apply the scenario's fault to it all the same (review Fix 1).
+room = os.environ["TC_ROOM"].replace("-", "%2D")
+url = os.environ["TECHNOCORE_URL"] + "/r/" + room + "?format=json"
+body = json.dumps({"from": os.environ["TC_WRITE_FROM"], "text": os.environ["TC_WRITE_TEXT"]}).encode()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+outcome = "not_written"
+for attempt in range(1, 4):
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with opener.open(req, timeout=float(os.environ["TC_WRITE_TIMEOUT"])) as resp:
+            resp.read()
+            if 200 <= resp.status < 300:
+                outcome = "confirmed"
+                break
+    except Exception:
+        continue
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write(json.dumps({"event": "write", "id": os.environ["TC_WRITE_ID"], "outcome": outcome}) + "\n")
+'''
+
+DELETE_EVENTS = r'''
+import json, os
+# Writes its event, then deletes the event log: the client's fault, to be judged, not a kit error.
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write(json.dumps({"event": "write", "id": os.environ["TC_WRITE_ID"], "outcome": "unconfirmed"}) + "\n")
+os.remove(os.environ["TC_EVENTS"])
+'''
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class WriterKitFixRound1(unittest.TestCase):
+    def test_encoded_room_cannot_dodge_the_fault(self):
+        code, report, output = run_script(ENCODED_NAIVE, "W2,W3,W4,W6,W7")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(
+            verdicts(report),
+            {"W2": "FAIL:duplicate_post", "W3": "FAIL:duplicate_post", "W4": "FAIL:duplicate_post",
+             "W6": "FAIL:false_confirmed", "W7": "FAIL:false_not_written"},
+            output,
+        )
+        for sid, r in report["scenarios"].items():
+            first = r["proxy_log"][0]
+            self.assertEqual(first["path_without_query"], f"/r/lab%2D{sid.lower()}", sid)
+            self.assertNotEqual(first["action"], "pass", sid)
+
+    def test_deleted_event_log_is_judged(self):
+        code, report, output = run_script(DELETE_EVENTS, "W0")
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("Traceback", output)
+        self.assertEqual(verdicts(report)["W0"], "FAIL:bad_events", output)
+        self.assertIn("no write event", report["scenarios"]["W0"]["reason"])
+
+
+class FaultAppliedPrecondition(unittest.TestCase):
+    """`check_fault_applied` on synthetic proxy logs; no upstream needed."""
+
+    @staticmethod
+    def entry(path, action, forwarded=True, status=200, method="POST"):
+        return {"method": method, "path_without_query": path, "action": action,
+                "forwarded": forwarded, "origin_status": status}
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO))
+        from consumer_lab import writers as W
+        from consumer_lab.scenarios import NotDeterministic
+        self.W, self.ND = W, NotDeterministic
+
+    def check(self, sid, log, stored):
+        self.W.check_fault_applied(self.W.WRITER_SCENARIOS[sid], log, stored)
+
+    def test_stored_without_the_fault_fails_closed(self):
+        with self.assertRaisesRegex(self.ND, "stored without passing the scenario's fault"):
+            self.check("W2", [self.entry("/r/lab-w2-unseen", "pass")], 1)
+        with self.assertRaisesRegex(self.ND, "stored without passing the scenario's fault"):
+            self.check("W5", [], 1)
+
+    def test_encoded_room_post_counts_as_the_room(self):
+        self.check("W2", [self.entry("/r/lab%2Dw2", "redirect_after_write(307)"),
+                          self.entry("/r/lab-w2", "pass")], 2)
+        with self.assertRaisesRegex(self.ND, "answered 200"):
+            self.check("W3", [self.entry("/r/lab%2dw3", "stall_after_write(10)", status=400)], 1)
+
+    def test_no_post_nothing_stored_is_judged(self):
+        self.check("W1", [], 0)
+        self.check("W0", [], 0)
+        self.check("W0", [self.entry("/r/lab-w0", "pass")], 1)
+
+    def test_not_forwarded_first_post(self):
+        self.check("W5", [self.entry("/r/lab-w5", "reset_before_write", forwarded=False, status=None),
+                          self.entry("/r/lab-w5", "pass")], 1)
+        with self.assertRaisesRegex(self.ND, "was not forwarded"):
+            self.check("W6", [self.entry("/r/lab-w6", "redirect_without_write(303)")], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
