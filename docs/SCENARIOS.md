@@ -43,11 +43,10 @@ and one `TC_EVENTS` file.
   the #481 bug: a client that advances to `last_seq` loses retained records silently.
 - **Reference clients.** naive: `FAIL:missed_retained` (it delivers 1..10 and 261..310).
   careful: PASS (sees `first_seq > since + 1`, exports, finds 11 at the start, delivers 11..310).
-- **The false-alarm check.** S1 is the only scenario with no loss. A client that reports a loss
-  on every poll after its first checkpoint (from its second cycle on) passes S2..S5 and fails
-  only S1 (`FAIL:bad_events`), so a PASS on one scenario, or on any subset without S1, says
-  much less than a PASS on `--scenario all`. One that also alarms on its first poll fails all
-  five with `FAIL:bad_events` (in S2..S5, a loss reported before the gap was observable).
+- **The false-alarm check.** S1 is the only scenario where nothing is lost, so it is the only
+  one that catches a client that reports losses that did not happen. A PASS on S2..S5 alone,
+  or on any single scenario, does not show that the client is free of false alarms: run
+  `--scenario all`.
 
 ## S2 `lag-beyond-retention`
 

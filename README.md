@@ -19,10 +19,9 @@ service, under concurrent writers, under compaction racing a read, against write
 or against any future upstream change. A FAIL, on the other hand, is a concrete reproducible
 case with a one-line reason.
 
-S1 has no loss: it is the false-alarm check. A client that reports a loss on every poll after
-its first checkpoint (from its second cycle on) passes S2..S5 and fails only S1 (one that also
-alarms on its first poll fails all five, `FAIL:bad_events`), so a PASS on one scenario, or on
-any subset without S1, says much less than a PASS on `--scenario all`.
+S1 is the only scenario where nothing is lost, so it is the only one that catches a client that
+reports losses that did not happen. A PASS on S2..S5 alone, or on any single scenario, does not
+show that the client is free of false alarms: run `--scenario all`.
 
 The kit ships two reference clients and checks itself with them on every test run:
 
