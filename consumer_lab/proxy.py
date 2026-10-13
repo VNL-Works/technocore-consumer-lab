@@ -22,7 +22,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from consumer_lab.server import SetupError
 
@@ -251,6 +251,9 @@ class FaultProxy:
     # ------------------------------------------------------------------ one connection
 
     def _choose(self, method: str, path: str) -> Action:
+        # Match on the percent-decoded path, as upstream routes it: `/r/lab%2Dw2` is the room
+        # `lab-w2` to Starlette, so it must get that room's action here too.
+        path = room_request_path(path)
         room_path = f"/r/{self.plan.room}"
         with self._cond:
             if method == "POST" and path == room_path:
@@ -364,6 +367,12 @@ class FaultProxy:
 
 
 # ---------------------------------------------------------------------- wire helpers
+
+
+def room_request_path(path: str) -> str:
+    """A request path as upstream routes it: percent-decoded (Starlette decodes the path
+    before matching `/r/{room}`). The proxy log keeps the raw path the client sent."""
+    return unquote(path)
 
 
 def _read_request(rfile) -> tuple[str, str, list[tuple[str, str]], bytes]:

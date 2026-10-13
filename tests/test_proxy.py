@@ -258,6 +258,36 @@ class ProxyActions(unittest.TestCase):
         self.assertEqual(len(self.origin.posts()), 1)
         self.assertEqual([r[1] for r in self.origin.requests if r[0] == "GET"], ["/rooms?format=json"])
 
+    def test_percent_encoded_room_gets_the_rules(self):
+        # Upstream routes the decoded path, so `/r/lab%2Dwx` is the room `lab-wx`: it must not
+        # dodge the first-post action, the later-post action or the room-read action.
+        enc = "/r/lab%2Dwx"
+        proxy = self.start(
+            first_post=P.redirect_after_write(307),
+            later_posts=P.reset_before_write(),
+            room_reads=P.unavailable(503),
+        )
+        data, _, _ = raw(proxy, "POST", enc + "?format=json", BODY)
+        self.assertTrue(data.startswith(b"HTTP/1.1 307 "))
+        _, exc, _ = raw(proxy, "POST", "/r/lab-w%78", BODY)  # %78 = "x"
+        self.assertIsInstance(exc, ConnectionResetError)
+        data, _, _ = raw(proxy, "GET", enc + "?format=json")
+        self.assertTrue(data.startswith(b"HTTP/1.1 503 "))
+        data, _, _ = raw(proxy, "GET", "/r/%6cab-wx/export")
+        self.assertTrue(data.startswith(b"HTTP/1.1 503 "))
+        self.assertTrue(proxy.wait_idle(5))
+        self.assertEqual(
+            [(e["path_without_query"], e["action"]) for e in proxy.log],
+            [
+                (enc, "redirect_after_write(307)"),
+                ("/r/lab-w%78", "reset_before_write"),
+                (enc, "unavailable(503)"),
+                ("/r/%6cab-wx/export", "unavailable(503)"),
+            ],
+        )
+        self.assertEqual(len(self.origin.posts()), 1)
+        self.assertEqual(P.room_request_path("/r/lab%2Dwx"), "/r/lab-wx")
+
     def test_chunked_body_is_411(self):
         proxy = self.start()
         data, _, _ = raw(proxy, "POST", f"/r/{ROOM}", headers=b"Transfer-Encoding: chunked\r\n")
