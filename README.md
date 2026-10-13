@@ -146,8 +146,10 @@ write as unreachable, so a retry posts it twice; PR
 write is not confirmed and to check whether it landed before retrying; and PR
 [#667](https://github.com/flop-labs/technocore-chat/pull/667) is the cut-off body case. A
 kit-owned proxy on `127.0.0.1` sits between your writer and the real upstream and injects one
-fault into your first `POST /r/{room}`, mostly *after* upstream stored it. The kit then counts
-the copies in the store and compares them with what your client claims.
+fault into your first `POST /r/{room}` (matched percent-decoded, as upstream routes it), mostly
+*after* upstream stored it. The kit then counts the copies of the exact text in the store (after
+upstream's trim; a retry that alters the text is not counted) and compares them with what your
+client claims. In W3, a client that half-closes its socket gets a close instead of a timeout.
 
 **A writer PASS means: no second copy and no false claim, against the pinned upstream, under
 these 8 controlled cases.** It does not mean your writer is correct under real network faults,

@@ -163,20 +163,27 @@ the proxy, and checks that the room holds exactly that record: the room exists, 
 follows a redirect reads a real room. The client then runs with `TECHNOCORE_URL` pointing at
 the kit's `FaultProxy` (`consumer_lab/proxy.py`), which relays to upstream on loopback and
 applies the scenario's action to the **first** `POST /r/{room}`; every other request passes
-through unless the scenario says otherwise. The text the client must post is
+through unless the scenario says otherwise. The proxy matches paths **percent-decoded**, as
+upstream routes them, so `/r/lab%2Dw2` is the room `lab-w2` and gets its fault too. The text the client must post is
 `consumer-lab write <id> <16 random hex>`, unique in the room; the kit checks in-process that
 upstream's `clean_text` keeps it unchanged, so `stored` counts what was posted.
 
 **Truth.** After the cycle the kit waits for the proxy to go idle (no handler in flight, no
 connection waiting in the listen backlog; at most 10 s), then counts the records in the room
 whose `text` equals the write text, with `store.read_messages(root, room, limit=MAX_LIMIT)`
-in-process, never through the proxy. The seed never counts and must still be there exactly
-once. The proxy's log (method, path without query, action, forwarded, origin status; no
+in-process, never through the proxy. Upstream trims the text, so a copy posted with extra
+surrounding whitespace still counts; a retry that **alters** the text (a suffix, a counter) is a
+different message and is not counted as a second copy. The seed never counts and must still be
+there exactly once. After the proxy has stopped, the kit waits for it once more and requires
+that no request arrived after its snapshot of the log. The proxy's log (method, path without query, action, forwarded, origin status; no
 bodies, no texts) is the truth about forwarding, and the kit asserts each scenario's
 precondition from it: in W1..W4 and W7 the first POST was forwarded and upstream answered 200
 (and the write is stored); in W5 and W6 it was not forwarded. A broken precondition is a setup
-error (exit 2), not a verdict. When no POST for the room reached the proxy at all (a client
-that crashed first, say), there is no precondition to check and the cycle is judged as is.
+error (exit 2), not a verdict. In W1..W7 the kit also fails closed when the message is
+stored but no room POST in the log got the scenario's fault: a write that reached upstream
+without the fault proves nothing. Only when no POST for the room reached the proxy and nothing
+is stored (a client that crashed first, say) is there nothing to check, and the cycle is judged
+as is. A client that deletes or empties its event log is judged on the empty log.
 
 **Determinism.** Every "after write" action reads upstream's whole reply before it misbehaves,
 so the write has committed before the client sees anything; no step waits on a timer except
@@ -228,7 +235,9 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
   handler ends at 10 s, or as soon as the client hangs up (nobody is left to be silent to; a
   client that posts and closes at once must not keep the proxy busy past the cycle), or when
   the kit stops the proxy; the kit waits for it before
-  counting, so the cycle stays well under 30 s and nothing in flight is missed.
+  counting, so the cycle stays well under 30 s and nothing in flight is missed. A client that
+  half-closes its socket (`shutdown(SHUT_WR)`) after sending the request reads as hung up: it
+  gets an immediate close instead of a timeout, which is just as ambiguous.
 
 ## W4 `truncated-after-write`
 
@@ -256,9 +265,12 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
 
 - **Proxy.** The first POST is truncated after the write. During the cycle every later
   `POST /r/{room}` is reset before the write, and every GET of `/r/{room}` or of a path under it
-  (`/r/{room}/export` included) gets `503` with a short plain-text body and is not forwarded.
-- **Expected.** Stored 1; `unconfirmed`. `confirmed` cannot be earned honestly (nothing the
-  client can do confirms the write), and `not_written` is false.
+  (`/r/{room}/export` included), in any percent-encoding, gets `503` with a short plain-text body
+  and is not forwarded. These are the only upstream read paths that return the room's messages;
+  `/rooms` still answers, with the room's head seq and size but no text.
+- **Expected.** Stored 1; `unconfirmed`. No read path shows the text, so a client cannot see its
+  write (one that infers it from the head seq in `/rooms` and says `confirmed` is right, and
+  passes); `not_written` is false.
 - **Why.** Honest reporting under total ambiguity. The naive writer retries, gets two resets,
   and concludes `not_written`: `FAIL:false_not_written`. Its retries never landed, but its
   first try did.
