@@ -170,6 +170,24 @@ class JudgeVerdicts(unittest.TestCase):
         truth = Truth(expected=[(1, 1)])
         self.assertEqual(self.verdict([d(1), {"event": "ack", "seq": 1}], truth), J.FAIL_BAD_EVENTS)
 
+    def test_bad_events_unknown_type_names_only_its_json_type(self):
+        # The reason reaches the JSON report, so it must not echo what the client wrote.
+        truth = Truth(expected=[(1, 1)])
+        secret = "consumer-lab-probe-7f3a9c1e5b2d4f60"
+        cases = [(secret, "string"), (1234567, "number"), ({"x": secret}, "object"),
+                 ([secret], "array"), (True, "boolean"), (None, "null")]
+        for value, word in cases:
+            with self.subTest(word):
+                events = [d(1), {"event": value, "seq": 1}]
+                v = judge("SX", events, truth, ok_cycles(events))
+                self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
+                self.assertEqual(v.reason, f"SX: malformed event log, line 2: unknown event type (a {word})")
+                self.assertNotIn(secret, v.reason)
+                self.assertNotIn("1234567", v.reason)
+        v = judge("SX", [{"seq": 1}], truth, ok_cycles([{"seq": 1}]))
+        self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
+        self.assertEqual(v.reason, "SX: malformed event log, line 1: unknown event type (a missing)")
+
     def test_bad_events_false_alarm(self):
         truth = Truth(expected=[(1, s) for s in range(1, 4)])
         events = [d(1), loss(1), d(2), d(3)]

@@ -362,6 +362,15 @@ with open(os.environ["TC_EVENTS"], "a") as f:
 '''
 
 
+TEXT_AS_EVENT = r'''
+import json, os
+# Writes the write text where the event type belongs: bad_events, and the reason must not
+# carry that text (or its 16-hex token) into the report.
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write(json.dumps({"event": os.environ["TC_WRITE_TEXT"], "id": os.environ["TC_WRITE_ID"]}) + "\n")
+'''
+
+
 def pid_alive(pid: int, grace: float = 2.0) -> bool:
     """Running (not a zombie) after up to `grace` seconds; the same check as test_hygiene.alive."""
     deadline = time.monotonic() + grace
@@ -409,6 +418,15 @@ class WriterKitV021(unittest.TestCase):
         self.assertIn("<other>", [e["method"] for e in log])  # the token as the method
         self.assertIn(("GET", "/r/lab-w0", True),  # the fragment
                       [(e["method"], e["path_without_query"], e["raw_path_differs"]) for e in log])
+
+    def test_report_never_carries_a_client_value_from_the_event(self):
+        code, report, output = run_script(TEXT_AS_EVENT, "W0")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(verdicts(report)["W0"], "FAIL:bad_events", output)
+        self.assertEqual(report["scenarios"]["W0"]["reason"], "W0: line 1: unknown event type (a string)")
+        text = json.dumps(report)
+        self.assertIsNone(re.search(r"\b[0-9a-f]{16}\b", text), text)
+        self.assertNotIn("consumer-lab write", text)
 
 
 class ReportLog(unittest.TestCase):

@@ -79,6 +79,33 @@ class WriterVerdicts(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self.v(lines, 1).verdict, WJ.FAIL_BAD_EVENTS)
 
+    def test_bad_events_reason_names_only_the_json_type(self):
+        # The reason reaches the JSON report, so it must not echo what the client wrote:
+        # here, the write text itself in place of the event type or the outcome.
+        text = "consumer-lab write W3 9e4c2a7b1d3f5a68"
+        values = [(text, "string"), (12345678, "number"), ({"t": text}, "object"),
+                  ([text], "array"), (False, "boolean"), (None, "null")]
+        for value, word in values:
+            with self.subTest(field="event", type=word):
+                line = json.dumps({"event": value, "id": WID, "outcome": "confirmed"})
+                r = self.v([line], 1)
+                self.assertEqual(r.verdict, WJ.FAIL_BAD_EVENTS)
+                self.assertEqual(r.reason, f"W3: line 1: unknown event type (a {word})")
+                self.assertNotIn(text, r.reason)
+                self.assertNotIn("9e4c2a7b1d3f5a68", r.reason)
+                self.assertNotIn("12345678", r.reason)
+            with self.subTest(field="outcome", type=word):
+                r = self.v([ev(value)], 1)
+                self.assertEqual(r.verdict, WJ.FAIL_BAD_EVENTS)
+                self.assertEqual(r.reason, f"W3: line 1: unknown outcome (a {word})")
+                self.assertNotIn(text, r.reason)
+                self.assertNotIn("9e4c2a7b1d3f5a68", r.reason)
+                self.assertNotIn("12345678", r.reason)
+        missing_event = json.dumps({"id": WID, "outcome": "confirmed"})
+        self.assertEqual(self.v([missing_event], 1).reason, "W3: line 1: unknown event type (a missing)")
+        missing_outcome = json.dumps({"event": "write", "id": WID})
+        self.assertEqual(self.v([missing_outcome], 1).reason, "W3: line 1: unknown outcome (a missing)")
+
     def test_bad_events_empty_log_exit_0(self):
         self.assertEqual(self.v([], 1, cycle=cyc(exit_code=0, n=0)).verdict, WJ.FAIL_BAD_EVENTS)
 

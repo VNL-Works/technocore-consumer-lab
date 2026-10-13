@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from consumer_lab.judge import Cycle, Verdict
+from consumer_lab.judge import Cycle, Verdict, json_type
 
 PASS = "PASS"
 FAIL_TIMEOUT = "FAIL:timeout"
@@ -75,11 +75,11 @@ def parse_write_events(lines: list[str], write_id: str) -> tuple[dict | None, st
         if not isinstance(ev, dict):
             return None, f"line {n}: event is not a JSON object"
         if ev.get("event") != "write":
-            return None, f"line {n}: unknown event type {ev.get('event')!r}"
+            return None, f"line {n}: unknown event type (a {json_type(ev, 'event')})"
         if ev.get("id") != write_id:
             return None, f"line {n}: write event for another id"
         if ev.get("outcome") not in OUTCOMES:
-            return None, f"line {n}: unknown outcome {ev.get('outcome')!r}"
+            return None, f"line {n}: unknown outcome (a {json_type(ev, 'outcome')})"
         if "detail" in ev and not isinstance(ev["detail"], str):
             return None, f"line {n}: detail must be a string"
         if "attempts" in ev and not _is_int(ev["attempts"]):

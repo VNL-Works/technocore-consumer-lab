@@ -112,6 +112,25 @@ def parse_events(lines: list[str]) -> tuple[list[dict], str | None]:
     return events, None
 
 
+def json_type(ev: dict, key: str) -> str:
+    """The JSON type of `ev[key]` ("missing" if absent), for a message that must not echo the
+    client's value itself: a reason reaches the report, which holds no client text."""
+    if key not in ev:
+        return "missing"
+    value = ev[key]
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
 def validate_event(ev: object) -> str | None:
     if not isinstance(ev, dict):
         return "event is not a JSON object"
@@ -123,7 +142,7 @@ def validate_event(ev: object) -> str | None:
         if not _is_int(ev.get("after_seq")) or not isinstance(ev.get("reason"), str):
             return "loss needs integer after_seq and string reason"
     else:
-        return f"unknown event type {kind!r}"
+        return f"unknown event type (a {json_type(ev, 'event')})"
     return None
 
 
