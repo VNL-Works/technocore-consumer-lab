@@ -19,9 +19,10 @@ service, under concurrent writers, under compaction racing a read, against write
 or against any future upstream change. A FAIL, on the other hand, is a concrete reproducible
 case with a one-line reason.
 
-S1 is the only scenario where nothing is lost, so it is the only one that catches a client that
-reports losses that did not happen. A PASS on S2..S5 alone, or on any single scenario, does not
-show that the client is free of false alarms: run `--scenario all`.
+S1 is the only scenario in which nothing is lost, so it is the only one that requires the client
+to report no loss at all. S2..S5 each contain a real gap, and a loss reported at that gap is
+accepted there. A PASS on S2..S5 alone, or on any single scenario, does not show that the
+client stays silent when nothing was lost: run `--scenario all`.
 
 The kit ships two reference clients and checks itself with them on every test run:
 
