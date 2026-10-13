@@ -22,13 +22,13 @@ def cyc(exit_code=0, timed_out=False, intact=True, n=1):
     return Cycle(exit_code, timed_out, 0, n, log_intact=intact)
 
 
-def truth(stored, sid="W3"):
-    return WriteTruth(scenario=sid, write_id=WID, stored=stored)
+def truth(stored, sid="W3", other=0):
+    return WriteTruth(scenario=sid, write_id=WID, stored=stored, other_records=other)
 
 
 class WriterVerdicts(unittest.TestCase):
-    def v(self, lines, stored, sid="W3", cycle=None):
-        verdict = judge_write(sid, lines, truth(stored, sid), cycle or cyc(n=len(lines)))
+    def v(self, lines, stored, sid="W3", cycle=None, other=0):
+        verdict = judge_write(sid, lines, truth(stored, sid, other), cycle or cyc(n=len(lines)))
         self.assertTrue(verdict.reason.startswith(f"{sid}: "), verdict.reason)
         self.assertNotIn("\n", verdict.reason)
         return verdict
@@ -97,6 +97,21 @@ class WriterVerdicts(unittest.TestCase):
                 self.assertEqual(self.v([ev(outcome)], 2).verdict, WJ.FAIL_DUPLICATE_POST)
         self.assertEqual(self.v([ev()], 3).verdict, WJ.FAIL_DUPLICATE_POST)
 
+    def test_extra_post(self):
+        for outcome in ("confirmed", "unconfirmed", "not_written"):
+            for stored in (0, 1):
+                with self.subTest(outcome=outcome, stored=stored):
+                    r = self.v([ev(outcome)], stored, other=1)
+                    self.assertEqual(r.verdict, WJ.FAIL_EXTRA_POST)
+                    self.assertEqual(r.reason, f"W3: the client posted 1 other record(s) to the room ({outcome})")
+        self.assertEqual(self.v([ev()], 1, other=3).reason, "W3: the client posted 3 other record(s) to the room (confirmed)")
+        for sid in ("W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7"):
+            with self.subTest(sid=sid):
+                self.assertEqual(self.v([ev("confirmed")], 1, sid=sid, other=1).verdict, WJ.FAIL_EXTRA_POST)
+
+    def test_no_other_records_is_no_extra_post(self):
+        self.assertEqual(self.v([ev("confirmed")], 1, other=0).verdict, WJ.PASS)
+
     def test_false_confirmed(self):
         self.assertEqual(self.v([ev("confirmed")], 0, sid="W6").verdict, WJ.FAIL_FALSE_CONFIRMED)
 
@@ -120,10 +135,10 @@ class WriterVerdicts(unittest.TestCase):
 
 class Precedence(unittest.TestCase):
     """The first matching rule wins: timeout > crash(empty) > bad_events > duplicate_post >
-    false_confirmed > false_not_written > W0 rules > PASS."""
+    extra_post > false_confirmed > false_not_written > W0 rules > PASS."""
 
-    def j(self, lines, stored, sid="W0", cycle=None):
-        return judge_write(sid, lines, truth(stored, sid), cycle or cyc()).verdict
+    def j(self, lines, stored, sid="W0", cycle=None, other=0):
+        return judge_write(sid, lines, truth(stored, sid, other), cycle or cyc()).verdict
 
     def test_order(self):
         # timeout beats an empty log with a non-zero exit, and a broken log
@@ -136,6 +151,16 @@ class Precedence(unittest.TestCase):
         self.assertEqual(self.j([ev()], 2, cycle=cyc(intact=False)), WJ.FAIL_BAD_EVENTS)
         # duplicate_post beats everything about the claim
         self.assertEqual(self.j([ev("not_written")], 2), WJ.FAIL_DUPLICATE_POST)
+        # bad_events beats extra_post
+        self.assertEqual(self.j(["junk"], 1, other=1), WJ.FAIL_BAD_EVENTS)
+        # duplicate_post beats extra_post
+        self.assertEqual(self.j([ev("confirmed")], 2, other=1), WJ.FAIL_DUPLICATE_POST)
+        # extra_post beats false_confirmed, missing_write and false_not_written
+        self.assertEqual(self.j([ev("confirmed")], 0, other=1), WJ.FAIL_EXTRA_POST)
+        self.assertEqual(self.j([ev("unconfirmed")], 0, other=1), WJ.FAIL_EXTRA_POST)
+        self.assertEqual(self.j([ev("not_written")], 1, other=1), WJ.FAIL_EXTRA_POST)
+        self.assertEqual(self.j([ev("confirmed")], 0, sid="W6", other=1), WJ.FAIL_EXTRA_POST)
+        self.assertEqual(self.j([ev("not_written")], 1, sid="W7", other=1), WJ.FAIL_EXTRA_POST)
         # false_confirmed beats missing_write (W0, stored 0)
         self.assertEqual(self.j([ev("confirmed")], 0), WJ.FAIL_FALSE_CONFIRMED)
         # false_not_written beats overcautious (W0, stored 1)
@@ -149,6 +174,7 @@ class Precedence(unittest.TestCase):
             self.j([], 0, cycle=cyc(exit_code=1)),
             self.j(["x"], 1),
             self.j([ev()], 2),
+            self.j([ev()], 1, other=1),
             self.j([ev("confirmed")], 0),
             self.j([ev("not_written")], 1),
             self.j([ev("unconfirmed")], 0),

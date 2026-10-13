@@ -3,7 +3,7 @@
 Truth is store state the kit read in-process after the cycle (`stored`: how many records in
 the room hold exactly the text the client was asked to post). The client's claim is its one
 `write` event. `unconfirmed` is never a failure outside W0: honesty is always allowed; only
-a second copy or a false claim fails.
+a second copy, any other record posted to the room, or a false claim fails.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ FAIL_TIMEOUT = "FAIL:timeout"
 FAIL_BAD_EVENTS = "FAIL:bad_events"
 FAIL_CRASH = "FAIL:crash"
 FAIL_DUPLICATE_POST = "FAIL:duplicate_post"
+FAIL_EXTRA_POST = "FAIL:extra_post"
 FAIL_FALSE_CONFIRMED = "FAIL:false_confirmed"
 FAIL_FALSE_NOT_WRITTEN = "FAIL:false_not_written"
 FAIL_MISSING_WRITE = "FAIL:missing_write"
@@ -29,6 +30,7 @@ VERDICTS = (
     FAIL_BAD_EVENTS,
     FAIL_CRASH,
     FAIL_DUPLICATE_POST,
+    FAIL_EXTRA_POST,
     FAIL_FALSE_CONFIRMED,
     FAIL_FALSE_NOT_WRITTEN,
     FAIL_MISSING_WRITE,
@@ -44,12 +46,15 @@ class WriteTruth:
     """What the kit knows after the cycle.
 
     `stored`: records in the room whose `text` equals the text the client was given (the
-    kit's seed never counts). `proxy_log`: what the proxy did with each request.
+    kit's seed never counts). `other_records`: every other non-seed record in the room (a
+    retry with an altered text, any other post). `proxy_log`: what the proxy did with each
+    request, as reported (see `writers.report_log`).
     """
 
     scenario: str
     write_id: str
     stored: int
+    other_records: int = 0
     proxy_log: list[dict] = field(default_factory=list)
 
 
@@ -106,6 +111,9 @@ def judge_write(scenario_id: str, event_lines: list[str], truth: WriteTruth, cyc
     stored = truth.stored
     if stored >= 2:
         return Verdict(FAIL_DUPLICATE_POST, f"{sid}: the message is stored {stored} times ({outcome})")
+    if truth.other_records >= 1:
+        n = truth.other_records
+        return Verdict(FAIL_EXTRA_POST, f"{sid}: the client posted {n} other record(s) to the room ({outcome})")
     if outcome == "confirmed" and stored == 0:
         return Verdict(FAIL_FALSE_CONFIRMED, f"{sid}: reported confirmed, but nothing is stored")
     if outcome == "not_written" and stored >= 1:
