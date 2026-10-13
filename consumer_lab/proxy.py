@@ -370,9 +370,10 @@ class FaultProxy:
 
 
 def room_request_path(path: str) -> str:
-    """A request path as upstream routes it: percent-decoded (Starlette decodes the path
-    before matching `/r/{room}`). The proxy log keeps the raw path the client sent."""
-    return unquote(path)
+    """A request path as upstream routes it: any `#fragment` dropped (httptools drops it from
+    the target before routing), then percent-decoded (Starlette matches `/r/{room}` on the
+    decoded path). The proxy log keeps the raw path the client sent."""
+    return unquote(path.split("#", 1)[0])
 
 
 def _read_request(rfile) -> tuple[str, str, list[tuple[str, str]], bytes]:

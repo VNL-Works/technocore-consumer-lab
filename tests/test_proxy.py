@@ -288,6 +288,30 @@ class ProxyActions(unittest.TestCase):
         self.assertEqual(len(self.origin.posts()), 1)
         self.assertEqual(P.room_request_path("/r/lab%2Dwx"), "/r/lab-wx")
 
+    def test_fragment_is_dropped_like_upstream(self):
+        # httptools drops `#...` from the target before upstream routes it, so `/r/lab-wx#x` is
+        # the room `lab-wx` there and must get the room's rules here (review 2, Fix 1).
+        proxy = self.start(
+            first_post=P.redirect_after_write(303),
+            later_posts=P.reset_before_write(),
+            room_reads=P.unavailable(503),
+        )
+        data, _, _ = raw(proxy, "POST", f"/r/{ROOM}#x", BODY)
+        self.assertTrue(data.startswith(b"HTTP/1.1 303 "))
+        _, exc, _ = raw(proxy, "POST", f"/r/{ROOM}#?format=json", BODY)
+        self.assertIsInstance(exc, ConnectionResetError)
+        for target in (f"/r/{ROOM}#x", f"/r/{ROOM}#?format=json&limit=200", f"/r/{ROOM}/export#x",
+                       f"/r/{ROOM}?format=json#x", "/r/lab%2Dwx#x"):
+            with self.subTest(target=target):
+                data, _, _ = raw(proxy, "GET", target)
+                self.assertTrue(data.startswith(b"HTTP/1.1 503 "), data[:40])
+        self.assertTrue(proxy.wait_idle(5))
+        self.assertEqual(len(self.origin.posts()), 1)  # only the first POST was forwarded
+        self.assertEqual([r for r in self.origin.requests if r[0] == "GET"], [])
+        self.assertEqual(P.room_request_path("/r/lab-wx#x"), "/r/lab-wx")
+        self.assertEqual(P.room_request_path("/r/lab-wx#a/export"), "/r/lab-wx")
+        self.assertEqual(P.room_request_path("/r/lab-wx%23x"), "/r/lab-wx#x")  # encoded: not a fragment
+
     def test_chunked_body_is_411(self):
         proxy = self.start()
         data, _, _ = raw(proxy, "POST", f"/r/{ROOM}", headers=b"Transfer-Encoding: chunked\r\n")
