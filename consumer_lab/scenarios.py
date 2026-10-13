@@ -49,9 +49,7 @@ class Kit:
         self.store = up.store
         self.root = up.root
         self.room = room
-        self.client_argv = [os.path.expanduser(a) for a in shlex.split(client_cmd)]
-        if not self.client_argv:
-            raise SetupError("empty --client command")
+        self.client_argv = client_argv(client_cmd)
         self.state_dir = workdir / "state"
         self.state_dir.mkdir()
         self.events_path = workdir / "events.jsonl"
@@ -87,40 +85,15 @@ class Kit:
         before = self.events_path.read_bytes()
         intact_before = before.startswith(self._log_prefix)
         first = _line_count(self.events_path)
-        # No CHAT_* knobs: the client gets the contract's variables, not the server's config.
-        env = {
-            **{k: v for k, v in os.environ.items() if not k.startswith("CHAT_")},
-            "TECHNOCORE_URL": self.up.url,
-            "TC_ROOM": self.room,
-            "TC_STATE_DIR": str(self.state_dir),
-            "TC_EVENTS": str(self.events_path),
-            "NO_PROXY": "127.0.0.1,localhost",
-            "no_proxy": "127.0.0.1,localhost",
-        }
-        timed_out = False
-        exit_code: int | None
-        try:
-            with open(self.stderr_path, "ab") as stderr:
-                proc = subprocess.Popen(
-                    self.client_argv,
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr,
-                    start_new_session=True,
-                )
-        except OSError as exc:
-            raise SetupError(f"cannot start client {self.client_argv[0]!r}: {exc.strerror}") from exc
-        try:
-            exit_code = proc.wait(timeout=self.cycle_timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-            exit_code = None
+        env = client_env(
+            {
+                "TECHNOCORE_URL": self.up.url,
+                "TC_ROOM": self.room,
+                "TC_STATE_DIR": str(self.state_dir),
+                "TC_EVENTS": str(self.events_path),
+            }
+        )
+        exit_code, timed_out = run_client(self.client_argv, env, self.stderr_path, self.cycle_timeout)
         after = self.events_path.read_bytes()
         # Append-only: what the log held before this cycle must still be its prefix, byte for
         # byte. (A rewrite to identical bytes is indistinguishable from an append, and harmless.)
@@ -165,6 +138,57 @@ class Kit:
         self.store.EPHEMERAL_TTL_SECONDS = _FrozenTTL(cutoff)
         got = self.store._cutoff(self.room)
         self.require(got == cutoff, f"_cutoff did not honour the frozen TTL ({got!r} != {cutoff!r})")
+
+
+# ---------------------------------------------------------------------- client launch (shared)
+
+
+def client_argv(client_cmd: str) -> list[str]:
+    """The `--client` command split like a shell would, `~` expanded; never run by a shell."""
+    argv = [os.path.expanduser(a) for a in shlex.split(client_cmd)]
+    if not argv:
+        raise SetupError("empty --client command")
+    return argv
+
+
+def client_env(contract: dict[str, str]) -> dict[str, str]:
+    """The kit's env minus every CHAT_* server knob, plus the contract's variables and a
+    loopback NO_PROXY, so a client never sees the server's config or routes via a proxy."""
+    return {
+        **{k: v for k, v in os.environ.items() if not k.startswith("CHAT_")},
+        **contract,
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
+    }
+
+
+def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
+    """Run one client cycle in its own session. Returns (exit code or None, timed out).
+
+    stdout is discarded and stderr appended to `stderr_path`; on timeout the whole process
+    group is killed, so a client cannot leave helpers running into the next step.
+    """
+    try:
+        with open(stderr_path, "ab") as stderr:
+            proc = subprocess.Popen(
+                argv,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        raise SetupError(f"cannot start client {argv[0]!r}: {exc.strerror}") from exc
+    try:
+        return proc.wait(timeout=timeout), False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        return None, True
 
 
 class _FrozenTTL(float):
