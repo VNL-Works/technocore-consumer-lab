@@ -3,8 +3,10 @@
 Per scenario: a fresh plain room `lab-wN`; one seed record posted straight to upstream (so
 the room exists and a read that follows a redirect reads a real room); then one client cycle
 through a `FaultProxy` whose plan injects the fault; then `proxy.wait_idle`, and the truth:
-how many records in the room hold exactly the text the client was given, read in-process
-with `store.read_messages`, never through the proxy.
+how many records in the room hold exactly the text the client was given, and how many other
+non-seed records it holds, read in-process with `store.read_messages`, never through the proxy.
+The proxy's log goes into the report only through `report_log`, which keeps no client-chosen
+path or method.
 
 Only public-but-internal upstream calls are used here (`store.read_messages`,
 `store.clean_text`, `store.MAX_LIMIT`); no private function, no store mutation.
@@ -105,8 +107,46 @@ def _seed(up: Upstream, room: str) -> None:
 
 
 def _texts(up: Upstream, room: str) -> list[str]:
-    view = up.store.read_messages(up.root, room, limit=up.store.MAX_LIMIT)
-    return [m.get("text") for m in view["messages"]]
+    limit = up.store.MAX_LIMIT
+    view = up.store.read_messages(up.root, room, limit=limit)
+    messages = view["messages"]
+    if len(messages) >= limit:
+        # The read may be cut off at the limit, so no count taken from it can be trusted.
+        raise NotDeterministic(
+            f"{room}: the room holds too many records to count ({len(messages)} read, limit {limit})"
+        )
+    return [m.get("text") for m in messages]
+
+
+REPORT_METHODS = frozenset(("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "?"))
+OTHER = "<other>"
+
+
+def report_entry(entry: dict, room: str) -> dict:
+    """One proxy log entry as the report shows it: nothing the client chose verbatim.
+
+    The path is reported as upstream routes it (`room_request_path`) when that is exactly
+    `/r/{room}`, `/r/{room}/export` or `/rooms`, else as `<other>`; the method is kept only if
+    it is a standard one (or the proxy's `?` for a request it could not parse), else `<other>`.
+    `raw_path_differs` says whether the client's raw path differed from the reported one.
+    """
+    raw = entry["path_without_query"]
+    routed = P.room_request_path(raw)
+    path = routed if routed in (f"/r/{room}", f"/r/{room}/export", "/rooms") else OTHER
+    method = entry["method"] if entry["method"] in REPORT_METHODS else OTHER
+    return {
+        "method": method,
+        "path_without_query": path,
+        "raw_path_differs": raw != path,
+        "action": entry["action"],
+        "forwarded": entry["forwarded"],
+        "origin_status": entry["origin_status"],
+    }
+
+
+def report_log(log: list[dict], room: str) -> list[dict]:
+    """The proxy log for the report (`report_entry` on each entry). The raw log stays internal."""
+    return [report_entry(e, room) for e in log]
 
 
 def _require(cond: bool, room: str, what: str) -> None:
@@ -212,14 +252,21 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
     texts = _texts(up, room)
     _require(texts.count(SEED_TEXT) == 1, room, "the seed is stored exactly once")
     stored = texts.count(text)
+    other_records = len(texts) - 1 - stored  # every non-seed record that is not the write text
     check_fault_applied(scenario, log, stored)
 
     # The log as it stood when the cycle ended is what gets judged. A change made after that
-    # and before this second read (a helper the client left behind, say) makes the log
-    # untrustworthy; later changes are not seen, but they cannot alter the verdict either.
+    # and before this second read (a helper that left the client's process group, say) makes
+    # the log untrustworthy; later changes are not seen, but they cannot alter the verdict.
     intact = _read_events(events_path) == at_end
     cycle = Cycle(exit_code, timed_out, 0, n_lines, log_intact=intact)
     lines = at_end.decode("utf-8", errors="replace").splitlines()
     event, _ = parse_write_events(lines, write_id)
-    truth = WriteTruth(scenario=scenario.id, write_id=write_id, stored=stored, proxy_log=log)
+    truth = WriteTruth(
+        scenario=scenario.id,
+        write_id=write_id,
+        stored=stored,
+        other_records=other_records,
+        proxy_log=report_log(log, room),
+    )
     return WriterRun(truth=truth, cycle=cycle, lines=lines, outcome=event["outcome"] if event else None)
