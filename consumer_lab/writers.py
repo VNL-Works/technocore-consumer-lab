@@ -206,6 +206,8 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
     # write: wait again (the counter outlives the listener) and require that nothing new came.
     _require(proxy.wait_idle(IDLE_TIMEOUT), room, "proxy idle after it stopped")
     _require(len(proxy.log) == len(log), room, "no request reached the proxy after the cycle's snapshot")
+    # Same entries, now with their final `forwarded` / `origin_status`: use those from here on.
+    log = [dict(e) for e in proxy.log]
 
     texts = _texts(up, room)
     _require(texts.count(SEED_TEXT) == 1, room, "the seed is stored exactly once")
