@@ -19,6 +19,10 @@ service, under concurrent writers, under compaction racing a read, against write
 or against any future upstream change. A FAIL, on the other hand, is a concrete reproducible
 case with a one-line reason.
 
+S1 has no loss: it is the false-alarm check. A client that reports a loss on every poll passes
+S2..S5 and fails only S1, so a PASS on one scenario, or on any subset without S1, says much
+less than a PASS on `--scenario all`.
+
 The kit ships two reference clients and checks itself with them on every test run:
 
 | scenario | `clients/naive_client.py` | `clients/careful_client.py` |
@@ -51,6 +55,15 @@ Private names are not an upstream contract. The kit is pinned to upstream commit
 what `docs/SCENARIOS.md` says. The kit refuses to start (exit 2) when `src/store.py` lacks
 `def _compact(` or `def _reap_pass(`, or when any function a scenario needs is missing.
 It does not vendor upstream: it runs an upstream tree you point it at.
+
+**Other upstream trees.** The kit was also run against two open upstream PRs, #800 (head
+`6ce0852`) and #910 (head `b72607e`), which make an empty window report the room head as
+`last_seq`. Observed on both: the careful client PASS on S1..S5, the naive client the same five
+FAILs as in the table above. The careful client's empty-window branch (an empty page with
+`last_seq` above the cursor), which cannot run at the pin, fired in S3 only, in its middle cycle.
+These runs report `upstream_commit: "unknown"` (the trees carry no marker), and the pin still
+governs what a scenario means. `tests/test_lab_variants.py` repeats them
+(`CONSUMER_LAB_VARIANT_UPSTREAMS`, `os.pathsep`-separated; an absent tree is skipped).
 
 ## S3 and S4 are a policy choice
 

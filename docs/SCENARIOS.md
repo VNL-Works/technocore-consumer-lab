@@ -43,6 +43,9 @@ and one `TC_EVENTS` file.
   the #481 bug: a client that advances to `last_seq` loses retained records silently.
 - **Reference clients.** naive: `FAIL:missed_retained` (it delivers 1..10 and 261..310).
   careful: PASS (sees `first_seq > since + 1`, exports, finds 11 at the start, delivers 11..310).
+- **The false-alarm check.** S1 is the only scenario with no loss. A client that reports a loss
+  on every poll passes S2..S5 and fails only S1 (`FAIL:bad_events`), so a PASS on one scenario,
+  or on any subset without S1, says much less than a PASS on `--scenario all`.
 
 ## S2 `lag-beyond-retention`
 
@@ -77,6 +80,14 @@ and one `TC_EVENTS` file.
   loop would checkpoint 6 and never notice: that is the composition bug found on 2026-10-13
   (PR #545 comment 6136144371). The careful client checks "empty page with `last_seq > since`"
   for that case too.
+- **On the #800/#910 trees** (open PRs, heads `6ce0852` and `b72607e`; not the pin). These
+  trees make an empty window report the room head, so the middle cycle's read is
+  `messages = []` with `last_seq = 6` above the cursor 3. Observed on both: the careful client
+  takes its empty-window branch there, writes `loss after_seq=3` ("empty window with last_seq 6
+  > since 3") in the middle cycle, moves its cursor to 6, and delivers 7 in the last cycle as
+  `first_seq = since + 1`: PASS. This is the only scenario where that branch ran
+  (`tests/test_lab_variants.py`); at the pin it never runs. The naive client still fails with
+  `FAIL:unreported_loss`, now because the empty page's `last_seq` moves it past 4..6.
 - **Reference clients.** naive: `FAIL:unreported_loss`. careful: PASS.
 
 ## S4 `ephemeral-prefix-expired`
@@ -86,6 +97,10 @@ and one `TC_EVENTS` file.
 - **Expected.** Same as S3.
 - **Why.** The window is non-empty (`[7]`), so the empty-window check never fires; only the
   `first_seq > since + 1` check (and an export that also starts at 7) reveals 4..6.
+- **On the #800/#910 trees.** The `last_seq` change is to the empty window only, and S4 has
+  none (#800 also adds `first_retained_seq`/`first_retained_ts` to every read, which neither
+  reference client reads). Observed on both: careful PASS through the `first_seq` check, naive
+  `FAIL:unreported_loss`, and no empty-window loss.
 - **Reference clients.** naive: `FAIL:unreported_loss` (observed and asserted). careful: PASS.
 
 ### How the cutoff is frozen (S3, S4)
