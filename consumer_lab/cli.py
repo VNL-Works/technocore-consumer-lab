@@ -1,10 +1,12 @@
-"""`python -m consumer_lab run --upstream <tree> --client "<cmd>" [--scenario S1..S5|all] [--json out.json]`
+"""`python -m consumer_lab run --upstream <tree> --client "<cmd>" [--scenario S1..S5|W0..W7|all|writers] [--json out.json]`
 
-Each scenario runs in its own worker process (`python -m consumer_lab _worker ...`) with its
-own temp root and its own in-process upstream server, because upstream reads its env knobs
-and caches per-root state at import. Exit codes: 0 all selected scenarios PASS, 1 any FAIL,
-2 setup error (bad tree, missing private functions, server failed to start, a scenario
-precondition that did not hold).
+Reader scenarios S1..S5 (`all`) and writer scenarios W0..W7 (`writers`) have different client
+contracts, so one run selects from one family only. Each scenario runs in its own worker
+process (`python -m consumer_lab _worker ...`) with its own temp root and its own in-process
+upstream server, because upstream reads its env knobs and caches per-root state at import;
+a writer scenario also runs its fault-injecting proxy there. Exit codes: 0 all selected
+scenarios PASS, 1 any FAIL, 2 setup error (bad tree, missing private functions, server failed
+to start, a scenario precondition that did not hold, S and W ids mixed in one run).
 """
 
 from __future__ import annotations
@@ -43,10 +45,15 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m consumer_lab", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     for name in ("run", "_worker"):
-        s = sub.add_parser(name, help="run reader fault scenarios" if name == "run" else argparse.SUPPRESS)
+        s = sub.add_parser(name, help="run reader or writer fault scenarios" if name == "run" else argparse.SUPPRESS)
         s.add_argument("--upstream", required=True, help="upstream technocore-chat working tree")
         s.add_argument("--client", required=True, help="client command, run once per cycle")
-        s.add_argument("--scenario", default="all", help="S1..S5 or all (default: all)")
+        s.add_argument(
+            "--scenario",
+            default="all",
+            help="reader ids S1..S5, writer ids W0..W7, a comma list of either family, "
+            "all (S1..S5) or writers (W0..W7); default: all",
+        )
         s.add_argument("--keep-root", action="store_true", help="keep each scenario's temp dir")
         if name == "run":
             s.add_argument("--json", dest="json_out", help="write a JSON report here")
@@ -55,13 +62,23 @@ def _parser() -> argparse.ArgumentParser:
 
 def _selected(arg: str) -> list[str]:
     from consumer_lab.scenarios import SCENARIOS
+    from consumer_lab.writers import WRITER_SCENARIOS
 
     if arg == "all":
         return list(SCENARIOS)
+    if arg == "writers":
+        return list(WRITER_SCENARIOS)
     wanted = [s.strip().upper() for s in arg.split(",") if s.strip()]
-    unknown = [s for s in wanted if s not in SCENARIOS]
+    unknown = [s for s in wanted if s not in SCENARIOS and s not in WRITER_SCENARIOS]
     if unknown or not wanted:
-        raise SetupError(f"unknown scenario {', '.join(unknown) or arg!r}; choose S1..S5 or all")
+        raise SetupError(
+            f"unknown scenario {', '.join(unknown) or arg!r}; choose S1..S5, W0..W7, all or writers"
+        )
+    if any(s in SCENARIOS for s in wanted) and any(s in WRITER_SCENARIOS for s in wanted):
+        raise SetupError(
+            "reader (S) and writer (W) scenarios cannot be mixed in one run: their client "
+            "contracts differ; run them separately"
+        )
     return wanted
 
 
@@ -70,7 +87,10 @@ def _worker(args) -> int:
     from consumer_lab.judge import judge
     from consumer_lab.scenarios import SCENARIOS, Kit
     from consumer_lab.server import Upstream
+    from consumer_lab.writers import WRITER_SCENARIOS
 
+    if args.scenario in WRITER_SCENARIOS:
+        return _writer_worker(args, WRITER_SCENARIOS[args.scenario])
     scenario = SCENARIOS[args.scenario]
     functions, names = _split_needs(scenario.needs)
     missing = missing_upstream_api(args.upstream, functions, names)
@@ -131,6 +151,79 @@ def _worker(args) -> int:
         if args.keep_root:
             if kit is not None:
                 outcome["cycle_exit_codes"] = [c.exit_code for c in kit.cycles]
+            try:
+                text = json.dumps(outcome, sort_keys=True, indent=2)
+                (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            print(f"kept {workdir}", file=sys.stderr)
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _writer_worker(args, scenario) -> int:
+    """The writer twin of `_worker`: one scenario, one client cycle through the proxy."""
+    from consumer_lab.server import Upstream
+    from consumer_lab.writer_judge import judge_write
+    from consumer_lab.writers import run_writer
+
+    functions, names = _split_needs(scenario.needs)
+    missing = missing_upstream_api(args.upstream, functions, names)
+    if missing:
+        raise SetupError(f"{scenario.id} needs upstream {', '.join(missing)}, missing from store.py")
+
+    workdir = Path(tempfile.mkdtemp(prefix=f"consumer-lab-{scenario.id.lower()}-"))
+    run = None
+    outcome: dict = {"id": scenario.id, "exit_code": 1, "error": "worker stopped before a verdict"}
+    try:
+        if str(workdir.resolve()).startswith("/mnt/"):
+            raise SetupError(f"temp dir {workdir} is on /mnt/; set TMPDIR to a Linux path")
+        root = workdir / "root"
+        root.mkdir()
+        up = Upstream(args.upstream, root)
+        try:
+            run = run_writer(scenario, up, args.client, workdir)
+        finally:
+            up.stop()
+        verdict = judge_write(scenario.id, run.lines, run.truth, run.cycle)
+        kinds: Counter[str] = Counter()
+        for line in run.lines:
+            if not line.strip():
+                continue
+            try:
+                kinds[str(json.loads(line).get("event"))] += 1
+            except (ValueError, AttributeError):
+                kinds["malformed"] += 1
+        # Never the write text: only counts, the claimed outcome and the proxy's log.
+        result = {
+            "id": scenario.id,
+            "name": scenario.name,
+            "verdict": verdict.verdict,
+            "reason": verdict.reason,
+            "cycles": 1,
+            "cycle_exit_codes": [run.cycle.exit_code],
+            "outcome": run.outcome,
+            "stored": run.truth.stored,
+            "proxy_log": run.truth.proxy_log,
+            "events": {
+                "write": kinds.get("write", 0),
+                "other": sum(v for k, v in kinds.items() if k != "write"),
+                "total": sum(kinds.values()),
+            },
+        }
+        print(json.dumps(result, sort_keys=True))
+        outcome = {**result, "exit_code": EXIT_PASS}
+        return EXIT_PASS
+    except SetupError as exc:
+        outcome = {"id": scenario.id, "exit_code": EXIT_SETUP, "setup_error": str(exc)}
+        raise
+    except BaseException as exc:
+        outcome = {"id": scenario.id, "exit_code": 1, "error": repr(exc)}
+        raise
+    finally:
+        if args.keep_root:
+            if run is not None:
+                outcome["cycle_exit_codes"] = [run.cycle.exit_code]
             try:
                 text = json.dumps(outcome, sort_keys=True, indent=2)
                 (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
