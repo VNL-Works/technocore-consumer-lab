@@ -141,10 +141,10 @@ lost, or before it could be seen, or a rewritten log). See `docs/SCENARIOS.md`.
 
 A write whose answer is lost may still have landed. Issue
 [#982](https://github.com/flop-labs/technocore-chat/issues/982) shows a wrapper reporting such a
-write as unreachable, so a retry posts it twice; open PR
+write as unreachable, so a retry can post it twice; open PR
 [#944](https://github.com/flop-labs/technocore-chat/pull/944) proposes telling a writer that a
 redirected write is not confirmed and to check whether it landed before retrying; and open PR
-[#667](https://github.com/flop-labs/technocore-chat/pull/667) handles the cut-off body case. A
+[#667](https://github.com/flop-labs/technocore-chat/pull/667) turns a cut-off body into a transport error. A
 kit-owned proxy on `127.0.0.1` sits between your writer and the real upstream and injects one
 fault into your first `POST /r/{room}` (matched as upstream routes it: fragment dropped, percent-decoded), mostly
 *after* upstream stored it. The kit then counts the copies of the exact text in the store (after
