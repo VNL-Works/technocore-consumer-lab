@@ -165,8 +165,10 @@ def client_env(contract: dict[str, str]) -> dict[str, str]:
 def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
     """Run one client cycle in its own session. Returns (exit code or None, timed out).
 
-    stdout is discarded and stderr appended to `stderr_path`; on timeout the whole process
-    group is killed, so a client cannot leave helpers running into the next step.
+    stdout is discarded and stderr appended to `stderr_path`. After every cycle, on timeout
+    and after a normal exit alike, the whole process group gets SIGKILL before this returns,
+    so a helper the client started in its group cannot keep running into the next step (a
+    process that left the group, e.g. via `setsid`, is not reached).
     """
     try:
         with open(stderr_path, "ab") as stderr:
@@ -181,14 +183,15 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
     except OSError as exc:
         raise SetupError(f"cannot start client {argv[0]!r}: {exc.strerror}") from exc
     try:
-        return proc.wait(timeout=timeout), False
+        exit_code, timed_out = proc.wait(timeout=timeout), False
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
-        return None, True
+        exit_code, timed_out = None, True
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass  # the group is already empty (or its id now belongs to someone else)
+    proc.wait()
+    return exit_code, timed_out
 
 
 class _FrozenTTL(float):
