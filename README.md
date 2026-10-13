@@ -146,5 +146,5 @@ saying how the run ended. The kit makes no outbound connection other than to its
 server. It writes nothing outside the temp dir and the output paths you name, except Python's
 own `consumer_lab/__pycache__` (gitignored); run with `python -B` to avoid even that.
 
-Out of scope: writer scenarios, a fault-injecting proxy, a compaction-during-read race, MCP
-clients, Windows and Docker. License: Apache-2.0, copyright VNL Works. technocore-chat is a separate Apache-2.0 project.
+Out of scope: writer scenarios, a fault-injecting proxy, a compaction-during-read race, MCP clients, Windows and Docker.
+License: Apache-2.0, copyright VNL Works; technocore-chat is a separate Apache-2.0 project. Built with AI assistance (Claude), and reviewed by a separate AI reviewer that did not write the code.
