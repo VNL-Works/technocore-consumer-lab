@@ -195,10 +195,11 @@ different message and is not counted as a second copy. The same read gives `othe
 every non-seed record in the room whose text is not the write text (an altered retry, any other
 post); a read that returns `MAX_LIMIT` records or more is a setup error, as it may be cut off.
 The seed never counts and must still be there exactly once. After the proxy has stopped, the kit waits for it once more and requires
-that no request arrived after its snapshot of the log. The proxy holds a connection that
-sends no request for up to 15 s (`CLIENT_READ_TIMEOUT`), longer than the 10 s idle wait, so a
-process that escaped the group kill (for example via `setsid`) and holds such a connection
-turns the run into a setup error (exit 2), not a verdict. The proxy's log (method, path
+that no request arrived after its snapshot of the log. After the cycle, and again after the
+proxy has stopped, the kit waits at most 10 s (`IDLE_TIMEOUT`) for the proxy to have no
+handler in flight and no connection in its backlog; if a connection to the proxy is still open
+then, for example from a process that escaped the group kill via `setsid`, the run is a setup
+error (exit 2), not a verdict. The proxy's log (method, path
 without query, action, forwarded, origin status; no bodies, no texts) is the truth about
 forwarding, and the kit asserts each scenario's
 precondition from it: in W1..W4 and W7 the first POST was forwarded and upstream answered 200
