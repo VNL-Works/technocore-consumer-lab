@@ -1,7 +1,7 @@
 [project]
 name = "technocore-consumer-lab"
-version = "0.1.0"
-description = "Reader fault scenarios for technocore-chat consumers, run against the real upstream service"
+version = "0.2.0"
+description = "Reader and writer fault scenarios for technocore-chat clients, run against the real upstream service"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"

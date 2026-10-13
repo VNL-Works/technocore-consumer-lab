@@ -1,6 +1,7 @@
 # Scenarios
 
-All five run against the real upstream app at commit
+Reader scenarios S1..S5 come first; the writer scenarios W0..W7 are in
+[Writer scenarios](#writer-scenarios-w0w7) at the end. All five reader scenarios run against the real upstream app at commit
 `0e47f770b13cc27e1e2e199d4cdf70a4778c97cc`, served on `127.0.0.1` from a fresh temp root in a
 fresh process. Writes go over HTTP (`POST /r/<room>?format=json`). The few non-HTTP steps are
 private `store` calls made in the server's own process, listed per scenario. The kit computes
@@ -152,3 +153,135 @@ order (`FAIL:out_of_order`), a loss written before its gap was observable (`FAIL
 a gap with no matching loss event before the first delivery past
 it (`FAIL:unreported_loss`), a retained record never delivered (`FAIL:missed_retained`), and
 finally a loss event where nothing was lost (`FAIL:bad_events`). Otherwise `PASS`.
+
+# Writer scenarios (W0..W7)
+
+Each writer scenario runs in a fresh worker process like a reader scenario, with a fresh plain
+room `lab-w0`..`lab-w7` (not `e-`), one message and **one** client cycle. Before the cycle the
+kit posts one seed record (`consumer-lab seed`, from `lab`) straight to upstream, not through
+the proxy, and checks that the room holds exactly that record: the room exists, so a read that
+follows a redirect reads a real room. The client then runs with `TECHNOCORE_URL` pointing at
+the kit's `FaultProxy` (`consumer_lab/proxy.py`), which relays to upstream on loopback and
+applies the scenario's action to the **first** `POST /r/{room}`; every other request passes
+through unless the scenario says otherwise. The text the client must post is
+`consumer-lab write <id> <16 random hex>`, unique in the room; the kit checks in-process that
+upstream's `clean_text` keeps it unchanged, so `stored` counts what was posted.
+
+**Truth.** After the cycle the kit waits for the proxy to go idle (no handler in flight, no
+connection waiting in the listen backlog; at most 10 s), then counts the records in the room
+whose `text` equals the write text, with `store.read_messages(root, room, limit=MAX_LIMIT)`
+in-process, never through the proxy. The seed never counts and must still be there exactly
+once. The proxy's log (method, path without query, action, forwarded, origin status; no
+bodies, no texts) is the truth about forwarding, and the kit asserts each scenario's
+precondition from it: in W1..W4 and W7 the first POST was forwarded and upstream answered 200
+(and the write is stored); in W5 and W6 it was not forwarded. A broken precondition is a setup
+error (exit 2), not a verdict. When no POST for the room reached the proxy at all (a client
+that crashed first, say), there is no precondition to check and the cycle is judged as is.
+
+**Determinism.** Every "after write" action reads upstream's whole reply before it misbehaves,
+so the write has committed before the client sees anything; no step waits on a timer except
+the W3 stall itself, which is the fault. `CHAT_DUPE_FILTER_SECONDS=0` lets an exact repeat of
+the text be stored again (probed at the pin: 7 identical posts in a row are all stored), so a
+second copy is always visible in the truth.
+
+| id | name | proxy action on the first POST | stored if the client posts once | naive | careful |
+|---|---|---|---|---|---|
+| W0 | clean | pass | 1 | PASS | PASS, confirmed |
+| W1 | redirect-303-after-write | forward, read the reply, discard it, answer 303 | 1 | PASS | PASS, confirmed |
+| W2 | redirect-307-after-write | as W1 with 307 | 1 | FAIL:duplicate_post | PASS, confirmed |
+| W3 | timeout-after-write | forward, read the reply, send nothing for 10 s, close | 1 | FAIL:duplicate_post | PASS, confirmed |
+| W4 | truncated-after-write | forward, relay status line and headers unchanged plus half the body, close | 1 | FAIL:duplicate_post | PASS, confirmed |
+| W5 | reset-before-write | read the request, never forward, close with `SO_LINGER` 0 (TCP reset) | 0 | PASS | PASS, unconfirmed |
+| W6 | redirect-without-write | never forward, answer 303 | 0 | FAIL:false_confirmed | PASS, unconfirmed |
+| W7 | unreadable-after-write | as W4; then every later POST is reset, every GET of the room is a 503 | 1 | FAIL:false_not_written | PASS, unconfirmed |
+
+Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
+
+## W0 `clean`
+
+- **Expected.** `confirmed`, stored 1. Any other outcome is `FAIL:overcautious`; nothing stored
+  is `FAIL:missing_write`.
+- **Why.** The control. A writer that never says `confirmed` passes every other scenario by
+  saying `unconfirmed`, and is useless; W0 is where that shows.
+
+## W1 `redirect-303-after-write`
+
+- **Expected.** Stored 1; `confirmed` (after a read-back, or after following the 303 to the
+  room) or `unconfirmed`.
+- **Why.** The PR #944 case. The write landed, but the answer is a redirect. Following a 303
+  turns the request into a GET, which posts nothing, so the naive writer passes, by luck: it
+  read a 200 from the room, not from its write. This PASS is kept on purpose: following a 303
+  after a committed write does no harm.
+
+## W2 `redirect-307-after-write`
+
+- **Expected.** Stored 1; `confirmed` or `unconfirmed`.
+- **Why.** A 307 keeps the method: a client that follows it, or (like urllib, which raises on
+  a POST 307) retries the error, re-POSTs. That second POST passes through the proxy and lands:
+  `FAIL:duplicate_post`.
+
+## W3 `timeout-after-write`
+
+- **Expected.** Stored 1; `confirmed` or `unconfirmed`.
+- **Why.** Issue #982: the write landed and the answer never came. The 10 s silence exceeds
+  `TC_WRITE_TIMEOUT` (3 s). A client that retries on timeout stores a second copy. The stalled
+  handler ends at 10 s (or at once when the kit stops the proxy); the kit waits for it before
+  counting, so the cycle stays well under 30 s and nothing in flight is missed.
+
+## W4 `truncated-after-write`
+
+- **Expected.** Stored 1; `confirmed` or `unconfirmed`.
+- **Why.** The PR #667 case: a 200 whose body is cut off (`IncompleteRead`). The status says
+  success, but a client that only trusts a *complete* reply, and then retries, posts twice.
+
+## W5 `reset-before-write`
+
+- **Expected.** Stored 0 unless the client retries (then 1); `unconfirmed`, or `confirmed`
+  after a retry that succeeded; `not_written` passes while nothing is stored.
+- **Why.** The control for retries: the request never reached upstream, so retrying it is
+  harmless. The naive writer passes (its retry lands once); the careful writer reads back,
+  does not find it, and says `unconfirmed`. A reset alone does not tell a client whether the
+  request arrived, so `not_written` is a guess here; it is a right guess, and the kit cannot
+  tell a right guess from knowledge.
+
+## W6 `redirect-without-write`
+
+- **Expected.** Stored 0; `unconfirmed` or `not_written`.
+- **Why.** A redirect is not a success. A client that follows the 303 to a 200 and calls that
+  `confirmed` claims a write that never happened: `FAIL:false_confirmed`.
+
+## W7 `unreadable-after-write`
+
+- **Proxy.** The first POST is truncated after the write. During the cycle every later
+  `POST /r/{room}` is reset before the write, and every GET of `/r/{room}` or of a path under it
+  (`/r/{room}/export` included) gets `503` with a short plain-text body and is not forwarded.
+- **Expected.** Stored 1; `unconfirmed`. `confirmed` cannot be earned honestly (nothing the
+  client can do confirms the write), and `not_written` is false.
+- **Why.** Honest reporting under total ambiguity. The naive writer retries, gets two resets,
+  and concludes `not_written`: `FAIL:false_not_written`. Its retries never landed, but its
+  first try did.
+
+## Writer judging
+
+`consumer_lab.writer_judge.judge_write`; the first rule that matches wins:
+
+1. `FAIL:timeout`: the cycle ran over 30 s (the process group is killed).
+2. `FAIL:crash`: a non-zero exit with an empty event log.
+3. `FAIL:bad_events`: the log changed after the cycle ended (the kit judges the log as it
+   stood when the client exited, and compares it again after the proxy went idle), malformed
+   JSONL, no `write` event for `TC_WRITE_ID`, more than one, an unknown outcome, any other
+   event kind or id, a non-string `detail` or a non-integer `attempts`.
+4. `FAIL:duplicate_post`: stored 2 or more, whatever the client claims.
+5. `FAIL:false_confirmed`: `confirmed`, stored 0.
+6. `FAIL:false_not_written`: `not_written`, stored 1 or more.
+7. W0 only: `FAIL:missing_write` (stored 0), then `FAIL:overcautious` (not `confirmed`).
+8. `PASS`, with the outcome and the count, e.g. `W5: unconfirmed, stored 0`.
+
+A non-zero exit with a valid write event is acceptable. **`unconfirmed` is never penalised
+outside W0**: when a client cannot know, saying so is the correct answer, and a kit that
+punished it would push writers towards guessing. **`not_written` must be backed by knowledge**
+(a 4xx refusal, or a read-back the client has reason to trust), because it is the claim that
+licenses a retry: a writer that says `not_written` about a write that landed will post it
+again, which is the duplicate this whole family is about. A `not_written` that happens to be
+true (nothing stored) passes; the kit cannot tell a guess from knowledge when the guess is
+right.
