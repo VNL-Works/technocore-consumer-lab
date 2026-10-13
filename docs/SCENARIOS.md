@@ -95,6 +95,16 @@ kit's clock, and no sleep is involved. Delays in a cycle cannot change the outco
 kit cannot survive is the system clock stepping backwards between two posts; the
 `ts7 > ts6` precondition then fails and the run is a setup error (exit 2), not a verdict.
 
+Side effects while the cutoff is frozen (S3 and S4 only, and only in the scenario's own
+worker process):
+- `GET /.well-known/agent.json` publishes `ephemeral_ttl_seconds` from the patched global, so
+  it shows a meaningless nominal value (e.g. `-0.99`), while `GET /config` still says 900
+  (it reads `config`, which is not patched).
+- The patched value is a `float` subclass that `orjson.dumps` refuses (`TypeError: Type is not
+  JSON serializable`). No code path the scenarios reach serializes it with orjson, but one
+  added upstream later would turn into a 500.
+- A client must therefore not derive the TTL from the manifest during S3/S4.
+
 ### Why S3 and S4 are a policy choice
 
 Upstream treats expiry in `e-` rooms as a promise ("gone by now"), not as a fault, so a reader
@@ -115,12 +125,26 @@ A client author who accepts silent expiry can read S3/S4 failures in that light.
   them as if nothing happened. Only the generation says it is a different conversation.
 - **Reference clients.** naive: `FAIL:unreported_loss`. careful: PASS.
 
+## When a loss counts
+
+A loss event satisfies a gap only if it is written **in or after the cycle in which the gap
+first becomes observable** from the pinned upstream's responses, and before the first delivery
+past the gap. The kit knows that cycle from its own steps: S2, S4 and S5 the second cycle, S3
+the third (its middle cycle sees an empty window with `last_seq = 3`, exactly what it would see
+had 4..6 never existed). A matching loss written earlier cannot be based on anything the client
+saw; it is graded `FAIL:bad_events` as a false alarm. So is a rewrite of the event log: after
+every cycle the kit checks that the bytes the log held before the cycle are still its prefix.
+Known limit: lines a client reorders within the cycle that wrote them are not detected; the kit
+trusts the client's ordering inside one cycle.
+
 ## Judging order
 
-The first failing check is the verdict: malformed events (`FAIL:bad_events`), a cycle over 30 s
+The first failing check is the verdict: a rewritten event log, then malformed events
+(both `FAIL:bad_events`), a cycle over 30 s
 (`FAIL:timeout`), a non-zero exit from a cycle that wrote no loss event (`FAIL:crash`), a
 delivery of a record that was not retained or under the wrong generation
 (`FAIL:delivered_lost`), a record delivered twice (`FAIL:duplicate`), deliveries out of store
-order (`FAIL:out_of_order`), a gap with no matching loss event before the first delivery past
+order (`FAIL:out_of_order`), a loss written before its gap was observable (`FAIL:bad_events`),
+a gap with no matching loss event before the first delivery past
 it (`FAIL:unreported_loss`), a retained record never delivered (`FAIL:missed_retained`), and
 finally a loss event where nothing was lost (`FAIL:bad_events`). Otherwise `PASS`.

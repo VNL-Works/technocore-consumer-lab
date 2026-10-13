@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 from consumer_lab import __version__
@@ -77,6 +78,10 @@ def _worker(args) -> int:
         raise SetupError(f"{scenario.id} needs upstream {', '.join(missing)}, missing from store.py")
 
     workdir = Path(tempfile.mkdtemp(prefix=f"consumer-lab-{scenario.id.lower()}-"))
+    kit = None
+    # How this worker ended, written to <workdir>/result.json when the dir is kept, so a kept
+    # root always says whether it holds a verdict, a setup error or a crash of the kit.
+    outcome: dict = {"id": scenario.id, "exit_code": 1, "error": "worker stopped before a verdict"}
     try:
         if str(workdir.resolve()).startswith("/mnt/"):
             raise SetupError(f"temp dir {workdir} is on /mnt/; set TMPDIR to a Linux path")
@@ -88,8 +93,11 @@ def _worker(args) -> int:
             truth = scenario.run(kit)
         finally:
             up.stop()
+        cycles = list(kit.cycles)
+        if cycles and not kit.log_intact():  # changed after the last cycle ended
+            cycles[-1] = replace(cycles[-1], log_intact=False)
         lines = kit.events_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        verdict = judge(scenario.id, lines, truth, kit.cycles)
+        verdict = judge(scenario.id, lines, truth, cycles)
         kinds: Counter[str] = Counter()
         for line in lines:
             try:
@@ -111,9 +119,23 @@ def _worker(args) -> int:
             },
         }
         print(json.dumps(result, sort_keys=True))
+        outcome = {**result, "exit_code": EXIT_PASS}
         return EXIT_PASS
+    except SetupError as exc:
+        outcome = {"id": scenario.id, "exit_code": EXIT_SETUP, "setup_error": str(exc)}
+        raise
+    except BaseException as exc:
+        outcome = {"id": scenario.id, "exit_code": 1, "error": repr(exc)}
+        raise
     finally:
         if args.keep_root:
+            if kit is not None:
+                outcome["cycle_exit_codes"] = [c.exit_code for c in kit.cycles]
+            try:
+                text = json.dumps(outcome, sort_keys=True, indent=2)
+                (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
+            except OSError:
+                pass
             print(f"kept {workdir}", file=sys.stderr)
         else:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -128,6 +150,10 @@ def _run(args) -> int:
     if missing:
         raise SetupError("pinned upstream API missing from store.py: " + ", ".join(missing))
     selected = _selected(args.scenario)
+    if args.json_out:
+        out_dir = Path(args.json_out).expanduser().resolve().parent
+        if not out_dir.is_dir():
+            raise SetupError(f"--json: directory {out_dir} does not exist")
 
     pkg_parent = str(Path(__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -167,7 +193,12 @@ def _run(args) -> int:
         "all_pass": setup_error is None and all(r["verdict"] == "PASS" for r in results.values()),
     }
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        try:
+            Path(args.json_out).expanduser().write_text(
+                json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            raise SetupError(f"--json: cannot write {args.json_out}: {exc.strerror}") from exc
     if setup_error:
         print(f"setup error: {setup_error}", file=sys.stderr)
         return EXIT_SETUP

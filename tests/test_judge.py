@@ -175,6 +175,35 @@ class JudgeVerdicts(unittest.TestCase):
         events = [d(1), loss(1), d(2), d(3)]
         self.assertEqual(self.verdict(events, truth), J.FAIL_BAD_EVENTS)
 
+    def test_bad_events_loss_before_gap_observable(self):
+        # The `wolf_first` shape: no gap detection at all, one pre-emptive loss at the end of
+        # cycle 1, before the kit removed anything. It must not satisfy the gap.
+        truth = Truth(
+            expected=GAP_TRUTH.expected,
+            lost=GAP_TRUTH.lost,
+            gaps=[Gap(after_seq=10, generation=1, observable_cycle=1)],
+        )
+        events = [d(s) for s in range(1, 11)] + [loss(10)] + [d(s) for s in range(61, 71)]
+        cycles = [Cycle(0, False, 0, 11), Cycle(0, False, 11, 21)]
+        v = judge("SX", events, truth, cycles)
+        self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
+        self.assertIn("before the gap was observable", v.reason)
+
+    def test_pass_loss_in_observable_cycle(self):
+        truth = Truth(
+            expected=GAP_TRUTH.expected,
+            lost=GAP_TRUTH.lost,
+            gaps=[Gap(after_seq=10, generation=1, observable_cycle=1)],
+        )
+        cycles = [Cycle(0, False, 0, 10), Cycle(0, False, 10, 21)]
+        self.assertEqual(self.verdict(GAP_OK, truth, cycles), J.PASS)
+
+    def test_bad_events_log_rewritten(self):
+        cycles = [Cycle(0, False, 0, 10), Cycle(0, False, 10, 21, log_intact=False)]
+        v = judge("SX", GAP_OK, GAP_TRUTH, cycles)
+        self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
+        self.assertIn("rewritten", v.reason)
+
     def test_every_verdict_is_covered(self):
         names = {n for n in dir(self) if n.startswith("test_")}
         for v in J.VERDICTS:

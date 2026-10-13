@@ -59,6 +59,7 @@ class Kit:
         self.stderr_path = workdir / "client.stderr"  # kept with --keep-root, for debugging
         self.cycle_timeout = cycle_timeout
         self.cycles: list[Cycle] = []
+        self._log_prefix = b""  # the log's bytes as of the end of the last cycle
         self._n = 0
 
     # ------------------------------------------------------------------ writes (HTTP)
@@ -83,9 +84,12 @@ class Kit:
     # ------------------------------------------------------------------ cycles
 
     def cycle(self) -> Cycle:
+        before = self.events_path.read_bytes()
+        intact_before = before.startswith(self._log_prefix)
         first = _line_count(self.events_path)
+        # No CHAT_* knobs: the client gets the contract's variables, not the server's config.
         env = {
-            **os.environ,
+            **{k: v for k, v in os.environ.items() if not k.startswith("CHAT_")},
             "TECHNOCORE_URL": self.up.url,
             "TC_ROOM": self.room,
             "TC_STATE_DIR": str(self.state_dir),
@@ -117,11 +121,20 @@ class Kit:
                 pass
             proc.wait()
             exit_code = None
-        c = Cycle(exit_code, timed_out, first, _line_count(self.events_path))
+        after = self.events_path.read_bytes()
+        # Append-only: what the log held before this cycle must still be its prefix, byte for
+        # byte. (A rewrite to identical bytes is indistinguishable from an append, and harmless.)
+        intact = intact_before and after.startswith(before)
+        self._log_prefix = after
+        c = Cycle(exit_code, timed_out, first, _line_count(self.events_path), log_intact=intact)
         self.cycles.append(c)
         return c
 
     # ------------------------------------------------------------------ store truth
+
+    def log_intact(self) -> bool:
+        """Whether the log still starts with what it held at the end of the last cycle."""
+        return self.events_path.read_bytes().startswith(self._log_prefix)
 
     def export_keys(self) -> list[tuple[int, int]]:
         """(generation, seq) of every record the store would export now."""
@@ -212,7 +225,7 @@ def s2_lag_beyond_retention(kit: Kit) -> Truth:
     return Truth(
         expected=_keys(gen, range(1, 11)) + retained,
         lost=set(_keys(gen, range(11, 61))),
-        gaps=[Gap(after_seq=10, generation=gen)],
+        gaps=[Gap(after_seq=10, generation=gen, observable_cycle=1)],
     )
 
 
@@ -240,7 +253,10 @@ def _ephemeral_common(kit: Kit, empty_poll_first: bool) -> Truth:
     return Truth(
         expected=_keys(gen, [1, 2, 3, 7]),
         lost=set(_keys(gen, [4, 5, 6])),
-        gaps=[Gap(after_seq=3, generation=gen)],
+        # S3: the middle cycle sees an empty window with last_seq 3, exactly what it would see
+        # had 4..6 never existed, so the gap is first observable in the third cycle. S4: the
+        # second cycle already sees first_seq 7.
+        gaps=[Gap(after_seq=3, generation=gen, observable_cycle=2 if empty_poll_first else 1)],
     )
 
 
@@ -269,7 +285,14 @@ def s5_room_recreated(kit: Kit) -> Truth:
     kit.cycle()
     return Truth(
         expected=old + recreated,
-        gaps=[Gap(after_seq=old[-1][1], generation=gen_old, reason_any=("generation", "recreated"))],
+        gaps=[
+            Gap(
+                after_seq=old[-1][1],
+                generation=gen_old,
+                reason_any=("generation", "recreated"),
+                observable_cycle=1,
+            )
+        ],
     )
 
 

@@ -41,11 +41,17 @@ class Gap:
     The client must emit `{"event":"loss","after_seq":after_seq,...}` before its first
     delivery of any record ordered after (generation, after_seq). `reason_any`, if set, is a
     list of substrings of which the loss reason must contain at least one (case-insensitive).
+
+    `observable_cycle` is the 0-based index of the first cycle in which the pinned upstream's
+    responses reveal the gap. A matching loss event written before that cycle started cannot
+    be based on anything the client saw: it is a false alarm (`FAIL:bad_events`) and does not
+    satisfy the gap. With no cycle information the whole log counts.
     """
 
     after_seq: int
     generation: int
     reason_any: tuple[str, ...] = ()
+    observable_cycle: int = 0
 
 
 @dataclass
@@ -70,6 +76,9 @@ class Cycle:
     timed_out: bool
     first_event: int  # index into the event list of the cycle's first appended event
     end_event: int  # one past its last
+    # False when, after this cycle, the log no longer starts with the bytes it held before
+    # the cycle: the client rewrote history instead of appending.
+    log_intact: bool = True
 
 
 @dataclass(frozen=True)
@@ -130,6 +139,11 @@ def judge(
     tells which slice of it each invocation wrote and how that invocation ended. Checks run
     in a fixed order, and the first failure found is the verdict.
     """
+    for n, c in enumerate(cycles, 1):
+        if not c.log_intact:
+            return Verdict(
+                FAIL_BAD_EVENTS, f"{scenario}: event log rewritten during cycle {n}, not appended"
+            )
     lines = [e if isinstance(e, str) else json.dumps(e) for e in events]
     parsed, error = parse_events(lines)
     if error:
@@ -185,13 +199,37 @@ def judge(
                 FAIL_OUT_OF_ORDER, f"{scenario}: seq {key[1]} delivered after seq {prev[1]}"
             )
 
+    def opens_at(gap: Gap) -> int:
+        """Parsed-event index from which a loss for `gap` can be based on what was seen."""
+        if not cycles or gap.observable_cycle <= 0:
+            return 0
+        if gap.observable_cycle >= len(cycles):
+            return len(parsed)
+        return index_of[min(cycles[gap.observable_cycle].first_event, len(lines))]
+
+    for gap in truth.gaps:
+        start = opens_at(gap)
+        early = [i for i, ev in losses if ev["after_seq"] == gap.after_seq and i < start]
+        if early:
+            cycle_no = next(
+                (n for n, c in enumerate(cycles, 1) if index_of[min(c.end_event, len(lines))] > early[0]),
+                1,
+            )
+            return Verdict(
+                FAIL_BAD_EVENTS,
+                f"{scenario}: loss after_seq={gap.after_seq} reported in cycle {cycle_no}, before "
+                f"the gap was observable (cycle {gap.observable_cycle + 1})",
+            )
+
     for gap in truth.gaps:
         boundary = (gap.generation, gap.after_seq)
         first_past = next((i for i, key in deliveries if key > boundary), None)
+        start = opens_at(gap)
         matching = [
             i
             for i, ev in losses
             if ev["after_seq"] == gap.after_seq
+            and i >= start
             and (
                 not gap.reason_any
                 or any(word.lower() in ev["reason"].lower() for word in gap.reason_any)
