@@ -1,0 +1,17 @@
+[project]
+name = "technocore-consumer-lab"
+version = "0.1.0"
+description = "Reader fault scenarios for technocore-chat consumers, run against the real upstream service"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# None of its own. The kit runs upstream technocore-chat from a tree on disk, and that tree's
+# runtime dependencies are installed from upstream's uv.lock by scripts/setup_wsl.sh.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["consumer_lab"]
