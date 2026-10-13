@@ -39,9 +39,10 @@ def have_tree(tree: Path) -> bool:
     return (tree / "src" / "store.py").is_file()
 
 
-def run_kept(client: str, upstream: Path) -> tuple[int, dict | None, str, dict[str, list[dict]]]:
+def run_kept(client: str, upstream: Path) -> tuple[int, dict | None, str, dict[str, list[dict] | None]]:
     """Run `--scenario all --keep-root`; return the exit code, report, output and each
-    scenario's events.jsonl. Every kept dir is deleted before this returns, pass or fail."""
+    scenario's events.jsonl (None when the log is missing). Every kept dir is deleted before
+    this returns, pass or fail."""
     with tempfile.TemporaryDirectory(prefix="consumer-lab-test-") as tmp:
         out = Path(tmp) / "report.json"
         cmd = [sys.executable, "-m", "consumer_lab", "run", "--upstream", str(upstream),
@@ -56,15 +57,16 @@ def run_kept(client: str, upstream: Path) -> tuple[int, dict | None, str, dict[s
             code, stdout, stderr = -1, text(exc.stdout), text(exc.stderr)
         report = json.loads(out.read_text()) if out.exists() else None
     kept = [ln.split(" ", 1)[1] for ln in stderr.splitlines() if ln.startswith("kept ")]
-    events: dict[str, list[dict]] = {}
+    events: dict[str, list[dict] | None] = {}
     try:
         for d in kept:
             m = re.match(r"consumer-lab-(s\d)-", Path(d).name)
             if m is None:
                 continue
             log = Path(d) / "events.jsonl"
-            lines = log.read_text().splitlines() if log.exists() else []
-            events[m.group(1).upper()] = [json.loads(ln) for ln in lines if ln.strip()]
+            # A missing log is None, not []: a check over "no events" must not pass by accident.
+            events[m.group(1).upper()] = ([json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
+                                          if log.exists() else None)
     finally:
         for d in kept:
             shutil.rmtree(d, ignore_errors=True)
@@ -86,9 +88,9 @@ def verdicts(report: dict) -> dict[str, str]:
     return {sid: r["verdict"] for sid, r in report["scenarios"].items()}
 
 
-def empty_window_losses(events: dict[str, list[dict]]) -> dict[str, list[dict]]:
+def empty_window_losses(events: dict[str, list[dict] | None]) -> dict[str, list[dict]]:
     return {sid: [e for e in evs if e.get("event") == "loss" and str(e.get("reason", "")).startswith(EMPTY_WINDOW)]
-            for sid, evs in events.items()}
+            for sid, evs in events.items() if evs is not None}
 
 
 class _VariantTree(unittest.TestCase):
@@ -162,6 +164,10 @@ class PinnedTreeContrast(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(verdicts(report), {sid: "PASS" for sid in SCENARIOS}, output)
         self.assertEqual(sorted(events), SCENARIOS, output)
+        # Not vacuous: every scenario's events.jsonl exists and holds events (S1 alone delivers
+        # 310 records), so "no empty-window loss" is a statement about real logs.
+        for sid in SCENARIOS:
+            self.assertTrue(events[sid], f"{sid}: events.jsonl missing or empty\n{output}")
         self.assertEqual({sid: losses for sid, losses in empty_window_losses(events).items() if losses}, {}, output)
 
 
