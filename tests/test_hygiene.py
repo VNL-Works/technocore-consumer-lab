@@ -66,8 +66,10 @@ class ProcessGroupKilledAfterEveryCycle(unittest.TestCase):
         exit_code, timed_out = run_client(argv, dict(os.environ), tmp / "client.stderr", 10.0)
         self.assertEqual((exit_code, timed_out), (0, False))
         pid = int(pidfile.read_text().strip())
-        self.addCleanup(kill_quietly, pid)  # never leave the helper behind, even on failure
-        self.assertFalse(alive(pid), f"helper {pid} outlived the cycle")
+        helper_alive = alive(pid)
+        if helper_alive:  # never leave the helper behind; never signal a pid already seen dead
+            self.addCleanup(kill_quietly, pid)
+        self.assertFalse(helper_alive, f"helper {pid} outlived the cycle")
 
 
 SLEEPER = "import time\ntime.sleep(8)\n"
