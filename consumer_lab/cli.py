@@ -2,11 +2,12 @@
 
 Reader scenarios S1..S5 (`all`) and writer scenarios W0..W7 (`writers`) have different client
 contracts, so one run selects from one family only. Each scenario runs in its own worker
-process (`python -m consumer_lab _worker ...`) with its own temp root and its own in-process
-upstream server, because upstream reads its env knobs and caches per-root state at import;
-a writer scenario also runs its fault-injecting proxy there. Exit codes: 0 all selected
-scenarios PASS, 1 any FAIL, 2 setup error (bad tree, missing private functions, server failed
-to start, a scenario precondition that did not hold, S and W ids mixed in one run).
+process (`python -m consumer_lab _worker ...`) with its own temp dir (created by the parent,
+so a worker that times out leaves none behind) and its own in-process upstream server,
+because upstream reads its env knobs and caches per-root state at import; a writer scenario
+also runs its fault-injecting proxy there. Exit codes: 0 all selected scenarios PASS, 1 any
+FAIL, 2 setup error (bad tree, missing private functions, server failed to start, a scenario
+precondition that did not hold, S and W ids mixed in one run).
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ def _parser() -> argparse.ArgumentParser:
         s.add_argument("--keep-root", action="store_true", help="keep each scenario's temp dir")
         if name == "run":
             s.add_argument("--json", dest="json_out", help="write a JSON report here")
+        else:
+            s.add_argument("--workdir", help=argparse.SUPPRESS)  # the scenario's temp dir, from `_run`
     return p
 
 
@@ -82,6 +85,15 @@ def _selected(arg: str) -> list[str]:
     return wanted
 
 
+def _new_workdir(sid: str) -> Path:
+    return Path(tempfile.mkdtemp(prefix=f"consumer-lab-{sid.lower()}-"))
+
+
+def _workdir(args, sid: str) -> Path:
+    """The dir `_run` created for this scenario; a worker started by hand makes its own."""
+    return Path(args.workdir) if args.workdir else _new_workdir(sid)
+
+
 def _worker(args) -> int:
     """Run one scenario in this process; print one JSON line with the result."""
     from consumer_lab.judge import judge
@@ -97,7 +109,7 @@ def _worker(args) -> int:
     if missing:
         raise SetupError(f"{scenario.id} needs upstream {', '.join(missing)}, missing from store.py")
 
-    workdir = Path(tempfile.mkdtemp(prefix=f"consumer-lab-{scenario.id.lower()}-"))
+    workdir = _workdir(args, scenario.id)
     kit = None
     # How this worker ended, written to <workdir>/result.json when the dir is kept, so a kept
     # root always says whether it holds a verdict, a setup error or a crash of the kit.
@@ -172,7 +184,7 @@ def _writer_worker(args, scenario) -> int:
     if missing:
         raise SetupError(f"{scenario.id} needs upstream {', '.join(missing)}, missing from store.py")
 
-    workdir = Path(tempfile.mkdtemp(prefix=f"consumer-lab-{scenario.id.lower()}-"))
+    workdir = _workdir(args, scenario.id)
     run = None
     outcome: dict = {"id": scenario.id, "exit_code": 1, "error": "worker stopped before a verdict"}
     try:
@@ -194,7 +206,8 @@ def _writer_worker(args, scenario) -> int:
                 kinds[str(json.loads(line).get("event"))] += 1
             except (ValueError, AttributeError):
                 kinds["malformed"] += 1
-        # Never the write text: only counts, the claimed outcome and the proxy's log.
+        # Never the write text: only counts, the claimed outcome and the proxy's log as
+        # `writers.report_log` reduced it (no client-chosen path or method).
         result = {
             "id": scenario.id,
             "name": scenario.name,
@@ -204,6 +217,7 @@ def _writer_worker(args, scenario) -> int:
             "cycle_exit_codes": [run.cycle.exit_code],
             "outcome": run.outcome,
             "stored": run.truth.stored,
+            "other_records": run.truth.other_records,
             "proxy_log": run.truth.proxy_log,
             "events": {
                 "write": kinds.get("write", 0),
@@ -255,15 +269,28 @@ def _run(args) -> int:
     results = {}
     setup_error = None
     for sid in selected:
+        workdir = _new_workdir(sid)
         cmd = [sys.executable, "-m", "consumer_lab", "_worker", "--upstream", str(tree),
-               "--client", args.client, "--scenario", sid]
+               "--client", args.client, "--scenario", sid, "--workdir", str(workdir)]
         if args.keep_root:
             cmd.append("--keep-root")
         try:
             proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=WORKER_TIMEOUT)
         except subprocess.TimeoutExpired:
             setup_error = f"{sid}: worker did not finish within {WORKER_TIMEOUT}s"
+            if args.keep_root:
+                result_json = {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error}
+                try:
+                    text = json.dumps(result_json, sort_keys=True, indent=2)
+                    (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
+                except OSError:
+                    pass
+                print(f"kept {workdir}", file=sys.stderr)
+            else:
+                shutil.rmtree(workdir, ignore_errors=True)
             break
+        if not args.keep_root:
+            shutil.rmtree(workdir, ignore_errors=True)  # the worker removes it; this is the backstop
         if proc.stderr.strip():
             sys.stderr.write(proc.stderr)
         if proc.returncode != EXIT_PASS:
