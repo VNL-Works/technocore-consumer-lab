@@ -163,8 +163,9 @@ the proxy, and checks that the room holds exactly that record: the room exists, 
 follows a redirect reads a real room. The client then runs with `TECHNOCORE_URL` pointing at
 the kit's `FaultProxy` (`consumer_lab/proxy.py`), which relays to upstream on loopback and
 applies the scenario's action to the **first** `POST /r/{room}`; every other request passes
-through unless the scenario says otherwise. The proxy matches paths **percent-decoded**, as
-upstream routes them, so `/r/lab%2Dw2` is the room `lab-w2` and gets its fault too. The text the client must post is
+through unless the scenario says otherwise. The proxy matches paths as
+upstream routes them: any `#fragment` dropped (as httptools does), then **percent-decoded**, so
+`/r/lab%2Dw2` and `/r/lab-w2#x` are the room `lab-w2` and get its fault too. The text the client must post is
 `consumer-lab write <id> <16 random hex>`, unique in the room; the kit checks in-process that
 upstream's `clean_text` keeps it unchanged, so `stored` counts what was posted.
 
@@ -215,7 +216,7 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
 
 - **Expected.** Stored 1; `confirmed` (after a read-back, or after following the 303 to the
   room) or `unconfirmed`.
-- **Why.** The PR #944 case. The write landed, but the answer is a redirect. Following a 303
+- **Why.** The case of open upstream PR #944. The write landed, but the answer is a redirect. Following a 303
   turns the request into a GET, which posts nothing, so the naive writer passes, by luck: it
   read a 200 from the room, not from its write. This PASS is kept on purpose: following a 303
   after a committed write does no harm.
@@ -242,7 +243,7 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
 ## W4 `truncated-after-write`
 
 - **Expected.** Stored 1; `confirmed` or `unconfirmed`.
-- **Why.** The PR #667 case: a 200 whose body is cut off (`IncompleteRead`). The status says
+- **Why.** The case of open upstream PR #667: a 200 whose body is cut off (`IncompleteRead`). The status says
   success, but a client that only trusts a *complete* reply, and then retries, posts twice.
 
 ## W5 `reset-before-write`
@@ -265,7 +266,8 @@ Redirects carry `Location: /r/{room}?format=json` and `Content-Length: 0`.
 
 - **Proxy.** The first POST is truncated after the write. During the cycle every later
   `POST /r/{room}` is reset before the write, and every GET of `/r/{room}` or of a path under it
-  (`/r/{room}/export` included), in any percent-encoding, gets `503` with a short plain-text body
+  (`/r/{room}/export` included), in any percent-encoding and with or without a `#fragment`,
+  gets `503` with a short plain-text body
   and is not forwarded. These are the only upstream read paths that return the room's messages;
   `/rooms` still answers, with the room's head seq and size but no text.
 - **Expected.** Stored 1; `unconfirmed`. No read path shows the text, so a client cannot see its
