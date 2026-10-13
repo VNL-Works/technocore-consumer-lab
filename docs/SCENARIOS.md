@@ -66,8 +66,12 @@ and one `TC_EVENTS` file.
   4..6 expired, 7 live (checked: only 7 readable after 3, export holds only 7). Cycle.
 - **Expected.** A loss event with `after_seq = 3`, at or before the delivery of 7. No
   delivery of 4..6. Silent advance is a failure.
-- **Why.** The middle cycle sees an empty window. At this pin `last_seq` stays at 3, so a
-  client cannot tell yet. When 7 arrives, `first_seq = 7 > 4` is the evidence. With #800/#910's
+- **Why.** The middle cycle's room read is an empty window, and at this pin its `last_seq`
+  stays at 3. The gap is already visible elsewhere, though: `GET /rooms?format=json` lists the
+  room's on-disk head (6, behind a listing cache of a few seconds), and head 6 above cursor 3
+  with nothing readable means records were dropped unread. So a loss reported in the middle
+  cycle is valid. A client that only reads the room learns it when 7 arrives:
+  `first_seq = 7 > 4` is the evidence. With #800/#910's
   empty-window `last_seq`, the middle cycle would instead hand back `last_seq = 6`, and #545's
   loop would checkpoint 6 and never notice: that is the composition bug found on 2026-10-13
   (PR #545 comment 6136144371). The careful client checks "empty page with `last_seq > since`"
@@ -129,10 +133,10 @@ A client author who accepts silent expiry can read S3/S4 failures in that light.
 
 A loss event satisfies a gap only if it is written **in or after the cycle in which the gap
 first becomes observable** from the pinned upstream's responses, and before the first delivery
-past the gap. The kit knows that cycle from its own steps: S2, S4 and S5 the second cycle, S3
-the third (its middle cycle sees an empty window with `last_seq = 3`, exactly what it would see
-had 4..6 never existed). A matching loss written earlier cannot be based on anything the client
-saw; it is graded `FAIL:bad_events` as a false alarm. So is a rewrite of the event log: after
+past the gap. The kit knows that cycle from its own steps: it is the first cycle after the kit
+step that created the gap, which is the second cycle in all of S2 to S5 (in S3 the room read is
+still empty then, but `/rooms` already shows the head at 6). A matching loss written earlier
+cannot be based on anything the client saw; it is graded `FAIL:bad_events` as a false alarm. So is a rewrite of the event log: after
 every cycle the kit checks that the bytes the log held before the cycle are still its prefix.
 Known limit: lines a client reorders within the cycle that wrote them are not detected; the kit
 trusts the client's ordering inside one cycle.

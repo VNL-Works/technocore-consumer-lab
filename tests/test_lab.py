@@ -101,6 +101,22 @@ if any(k.startswith("CHAT_") for k in os.environ):
 '''
 
 
+EARLY_S3 = r'''
+import json, os, runpy, sys
+# The careful client, plus a loss for the S3 gap written in the second cycle, the earliest
+# cycle in which the gap exists (a /rooms-aware client can see it there). Deterministic: it
+# keys on its own invocation count, not on the /rooms cache.
+state = os.path.join(os.environ["TC_STATE_DIR"], "invocations")
+n = int(open(state).read()) if os.path.exists(state) else 0
+open(state, "w").write(str(n + 1))
+if n == 1:
+    with open(os.environ["TC_EVENTS"], "a") as f:
+        f.write(json.dumps({"event": "loss", "after_seq": 3, "reason": "head 6 above cursor 3"}) + "\n")
+sys.argv = [CAREFUL]
+runpy.run_path(CAREFUL, run_name="__main__")
+'''
+
+
 def run_script_client(source: str, scenario: str, *extra: str) -> tuple[int, dict | None, str]:
     with tempfile.TemporaryDirectory(prefix="consumer-lab-client-") as tmp:
         script = Path(tmp) / "client.py"
@@ -121,6 +137,14 @@ class KitHardening(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertEqual(verdicts(report)["S1"], "FAIL:bad_events", output)
         self.assertIn("rewritten", report["scenarios"]["S1"]["reason"])
+
+    def test_s3_loss_in_second_cycle_passes(self):
+        # Regression (review R-1): S3's gap is observable from the second cycle.
+        source = f"CAREFUL = {str(REPO / 'clients' / 'careful_client.py')!r}\n" + EARLY_S3
+        code, report, output = run_script_client(source, "S3")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(verdicts(report)["S3"], "PASS", output)
+        self.assertEqual(report["scenarios"]["S3"]["events"]["loss"], 2, output)
 
     def test_client_gets_no_chat_env(self):
         code, report, output = run_script_client(ENV_PROBE, "S1")

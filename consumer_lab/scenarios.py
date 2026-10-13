@@ -253,10 +253,11 @@ def _ephemeral_common(kit: Kit, empty_poll_first: bool) -> Truth:
     return Truth(
         expected=_keys(gen, [1, 2, 3, 7]),
         lost=set(_keys(gen, [4, 5, 6])),
-        # S3: the middle cycle sees an empty window with last_seq 3, exactly what it would see
-        # had 4..6 never existed, so the gap is first observable in the third cycle. S4: the
-        # second cycle already sees first_seq 7.
-        gaps=[Gap(after_seq=3, generation=gen, observable_cycle=2 if empty_poll_first else 1)],
+        # The gap exists from the first cycle after the kit expired 4..6, i.e. the second cycle,
+        # in both S3 and S4. In S3 the room read is an empty window with last_seq 3 there, but
+        # `/rooms?format=json` already lists the room's on-disk head as 6, so a client can see
+        # it. S4's second cycle sees first_seq 7.
+        gaps=[Gap(after_seq=3, generation=gen, observable_cycle=1)],
     )
 
 
