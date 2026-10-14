@@ -1,6 +1,6 @@
 [project]
 name = "technocore-consumer-lab"
-version = "0.2.3"
+version = "0.2.4"
 description = "Reader and writer fault scenarios for technocore-chat clients, run against the real upstream service"
 readme = "README.md"
 license = "Apache-2.0"
