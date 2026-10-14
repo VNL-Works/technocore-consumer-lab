@@ -6,13 +6,17 @@ scripts/setup_wsl.sh, and an upstream tree (CONSUMER_LAB_UPSTREAM, default
 ~/consumer-lab-upstream-0e47f77). Skipped, loudly, when the tree is absent.
 """
 
+import contextlib
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
@@ -125,6 +129,15 @@ with open(os.environ["TC_EVENTS"], "a") as f:
 '''
 
 
+PARTIAL_STDOUT = r'''
+import os
+# Leaves a partial line, with no newline, on the worker's stdout (the parent reads the
+# worker's last stdout line as its result), then exits normally without events.
+fd = os.open(f"/proc/{os.getppid()}/fd/1", os.O_WRONLY)
+os.write(fd, b'{"forged": ')
+'''
+
+
 def run_script_client(source: str, scenario: str, *extra: str) -> tuple[int, dict | None, str]:
     with tempfile.TemporaryDirectory(prefix="consumer-lab-client-") as tmp:
         script = Path(tmp) / "client.py"
@@ -183,6 +196,15 @@ class KitHardening(unittest.TestCase):
         self.assertEqual((events["deliver"], events["loss"]), (0, 0), output)
         self.assertEqual(events["other"], events["total"], output)  # each line counted malformed
 
+    def test_partial_line_on_the_workers_stdout_is_not_joined_to_the_result(self):
+        # The parent used to json.loads the joined line and crash: no report, exit 1.
+        code, report, output = run_script_client(PARTIAL_STDOUT, "S1")
+        self.assertIsNotNone(report, output)
+        self.assertEqual(code, 1, output)
+        self.assertIsNone(report["setup_error"], output)
+        self.assertEqual(verdicts(report)["S1"], "FAIL:missed_retained", output)
+        self.assertNotIn("Traceback", output)
+
     def test_json_into_missing_dir_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "no-such-dir" / "x.json"
@@ -193,6 +215,61 @@ class KitHardening(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertEqual(proc.stderr.strip().splitlines(), [f"setup error: --json: directory {target.parent} does not exist"])
+
+
+class InvalidWorkerResult(unittest.TestCase):
+    """`_run` with a worker that exits 0 but prints no valid result: a setup error worded by
+    the kit, with a report, never a crash. After the worker's fresh-line result (v0.2.3) no
+    client recipe reaches this path, so the worker is mocked; no upstream needed."""
+
+    def run_with_stdout(self, stdout: bytes) -> tuple[int, dict | None, str]:
+        sys.path.insert(0, str(REPO))
+        from consumer_lab import cli
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-wres-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = tmp / "report.json"
+        done = subprocess.CompletedProcess(["worker"], 0, stdout=stdout, stderr=b"")
+        argv = ["run", "--upstream", str(tmp), "--client", "true", "--scenario", "S1", "--json", str(out)]
+        err = io.StringIO()
+        with mock.patch.object(cli, "marker_ok", return_value=(True, "")), \
+                mock.patch.object(cli, "missing_upstream_api", return_value=[]), \
+                mock.patch.object(cli, "upstream_commit", return_value="unknown"), \
+                mock.patch.object(cli.subprocess, "run", return_value=done), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        report = json.loads(out.read_text()) if out.exists() else None
+        return code, report, err.getvalue()
+
+    def test_invalid_result_is_a_setup_error(self):
+        for stdout in (
+            b"",
+            b"\n\n",
+            b"not json\n",
+            b'{"forged": \n',
+            b"[1, 2]\n",
+            b'"S1"\n',
+            b'{"id": "S1", "name": "x", "verdict": "PASS"}\n',  # no reason
+            b'{"name": "x", "verdict": "PASS", "reason": "r"}\n',  # no id
+            b'{"id": "S1", "name": null, "verdict": "PASS", "reason": "r"}\n',
+            b'{"id": "S1", "name": "x", "verdict": ["PASS"], "reason": "r"}\n',
+            b"\xff\xfe\n",
+            b"[" * 200000 + b"\n",
+        ):
+            with self.subTest(stdout=stdout[:60]):
+                code, report, err = self.run_with_stdout(stdout)
+                self.assertEqual(code, 2, err)
+                self.assertIsNotNone(report, err)
+                self.assertEqual(report["setup_error"], "S1: worker printed no valid result")
+                self.assertEqual(report["scenarios"], {})
+                self.assertFalse(report["all_pass"])
+                self.assertEqual(err.strip().splitlines()[-1], "setup error: S1: worker printed no valid result")
+
+    def test_valid_result_after_junk_is_taken(self):
+        line = b'{"id": "S1", "name": "n", "verdict": "PASS", "reason": "r"}'
+        code, report, err = self.run_with_stdout(b'{"forged": \n' + line + b"\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["scenarios"]["S1"]["verdict"], "PASS")
+        self.assertIsNone(report["setup_error"])
 
 
 class SetupErrors(unittest.TestCase):

@@ -94,6 +94,14 @@ def _workdir(args, sid: str) -> Path:
     return Path(args.workdir) if args.workdir else _new_workdir(sid)
 
 
+def _print_result(result: dict) -> None:
+    """The worker's one JSON result line. The client shares this stdout (it can write to
+    /proc/<ppid>/fd/1): start a fresh line, so that a partial line it left cannot be joined
+    to the result."""
+    sys.stdout.write("\n" + json.dumps(result, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
 def _worker(args) -> int:
     """Run one scenario in this process; print one JSON line with the result."""
     from consumer_lab.judge import judge
@@ -150,7 +158,7 @@ def _worker(args) -> int:
                 "total": len(lines),
             },
         }
-        print(json.dumps(result, sort_keys=True))
+        _print_result(result)
         outcome = {**result, "exit_code": EXIT_PASS}
         return EXIT_PASS
     except SetupError as exc:
@@ -225,7 +233,7 @@ def _writer_worker(args, scenario) -> int:
                 "total": sum(kinds.values()),
             },
         }
-        print(json.dumps(result, sort_keys=True))
+        _print_result(result)
         outcome = {**result, "exit_code": EXIT_PASS}
         return EXIT_PASS
     except SetupError as exc:
@@ -261,6 +269,38 @@ def _worker_failure(returncode: int, stderr: str) -> str:
     return "kit error, see stderr"
 
 
+RESULT_KEYS = ("id", "name", "verdict", "reason")  # what `_run` and the report read
+
+
+def _worker_result(stdout: str) -> dict | None:
+    """The result from the last non-empty line of a worker's stdout, or None when that line
+    is missing, not JSON, not a JSON object, or lacks a key `_run` reads (name, verdict and
+    reason must be strings: they are printed with a format spec)."""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    try:
+        result = json.loads(lines[-1])
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(result, dict) or any(k not in result for k in RESULT_KEYS):
+        return None
+    if not all(isinstance(result[k], str) for k in ("name", "verdict", "reason")):
+        return None
+    return result
+
+
+def _keep_result_json(workdir: Path, sid: str, setup_error: str) -> None:
+    """`--keep-root` for a worker that could not write its own result.json."""
+    result_json = {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error}
+    try:
+        text = json.dumps(result_json, sort_keys=True, indent=2)
+        (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    print(f"kept {workdir}", file=sys.stderr)
+
+
 def _run(args) -> int:
     tree = Path(args.upstream).expanduser().resolve()
     ok, reason = marker_ok(tree)
@@ -288,29 +328,32 @@ def _run(args) -> int:
         if args.keep_root:
             cmd.append("--keep-root")
         try:
-            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=WORKER_TIMEOUT)
+            # Bytes, decoded here with replacement: the client shares the worker's stdout and
+            # stderr, so either may hold anything, invalid UTF-8 included.
+            proc = subprocess.run(cmd, env=env, capture_output=True, timeout=WORKER_TIMEOUT)
         except subprocess.TimeoutExpired:
             setup_error = f"{sid}: worker did not finish within {WORKER_TIMEOUT}s"
             if args.keep_root:
-                result_json = {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error}
-                try:
-                    text = json.dumps(result_json, sort_keys=True, indent=2)
-                    (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
-                except OSError:
-                    pass
-                print(f"kept {workdir}", file=sys.stderr)
+                _keep_result_json(workdir, sid, setup_error)
             else:
                 shutil.rmtree(workdir, ignore_errors=True)
             break
         if not args.keep_root:
             shutil.rmtree(workdir, ignore_errors=True)  # the worker removes it; this is the backstop
-        if proc.stderr.strip():
-            sys.stderr.write(proc.stderr)
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        if stderr.strip():
+            sys.stderr.write(stderr)
         if proc.returncode != EXIT_PASS:
-            detail = _worker_failure(proc.returncode, proc.stderr)
+            detail = _worker_failure(proc.returncode, stderr)
             setup_error = f"{sid}: worker exited {proc.returncode}: {detail}"
+            if args.keep_root and proc.returncode < 0 and not (workdir / "result.json").exists():
+                _keep_result_json(workdir, sid, setup_error)  # killed before it could write one
             break
-        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        result = _worker_result(stdout)
+        if result is None:
+            setup_error = f"{sid}: worker printed no valid result"
+            break
         results[sid] = result
         print(f"{sid} {result['name']:<26} {result['verdict']:<22} {result['reason']}")
 

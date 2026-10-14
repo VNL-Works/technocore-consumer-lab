@@ -506,6 +506,45 @@ class WriterKitV022(unittest.TestCase):
         self.assertIn(PARTIAL_MARKER, output)  # still copied to the kit's stderr
 
 
+UTF8_MARKER = "consumer-lab-c2-utf8-marker-5b19"
+
+# Set FD before this source (1 or 2): writes invalid UTF-8, with no newline, to that fd of the
+# worker, then posts nothing and says so honestly.
+BAD_UTF8 = r'''
+import json, os
+fd = os.open(f"/proc/{os.getppid()}/fd/{FD}", os.O_WRONLY)
+os.write(fd, b"\xff\xfe consumer-lab-c2-utf8-marker-5b19 \xff\xfe")
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write(json.dumps({"event": "write", "id": os.environ["TC_WRITE_ID"], "outcome": "not_written"}) + "\n")
+'''
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class WriterKitV023(unittest.TestCase):
+    """Invalid UTF-8 on the worker's stdout or stderr: a report, not a crash of the parent."""
+
+    def check(self, fd: int) -> str:
+        code, report, output = run_script(f"FD = {fd}\n" + BAD_UTF8, "W0")
+        self.assertIsNotNone(report, output)
+        self.assertNotIn("Traceback", output)
+        self.assertIsNone(report["setup_error"], output)
+        # W0 wants the write; this client posts nothing and says so: judged, not crashed.
+        self.assertEqual(verdicts(report), {"W0": "FAIL:missing_write"}, output)
+        self.assertEqual(report["scenarios"]["W0"]["reason"], "W0: nothing stored on a clean path (not_written)")
+        self.assertEqual(report["scenarios"]["W0"]["outcome"], "not_written", output)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn(UTF8_MARKER, json.dumps(report))
+        return output
+
+    def test_invalid_utf8_on_the_workers_stderr(self):
+        output = self.check(2)
+        bad = chr(0xFFFD) * 2  # each invalid byte, replaced
+        self.assertIn(f"{bad} {UTF8_MARKER} {bad}", output)  # still copied to the kit's stderr
+
+    def test_invalid_utf8_on_the_workers_stdout(self):
+        self.check(1)
+
+
 class ReportLog(unittest.TestCase):
     """`writers.report_entry` on synthetic proxy log entries; no upstream needed."""
 
