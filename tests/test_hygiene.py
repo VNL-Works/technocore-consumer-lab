@@ -9,7 +9,8 @@
   or into a workdir it swapped for a link, and the parent says when it did not write one
   (silent only for the worker's own file after exit -2); the asynchronous terminating signals
   and stop signals a client sends its worker (SIGTERM, SIGALRM, SIGTSTP, a real-time signal, or
-  a SIGINT that lands just before the kill) are deferred until the group is killed, and SIGINT's
+  a SIGINT that lands just before the kill) are deferred until the group is killed (a stop
+  signal is then dropped with a kit line, and cannot mask a terminating one), and SIGINT's
   handler is restored last; `run_client` off the main thread is a setup error.
 """
 
@@ -386,8 +387,9 @@ time.sleep(2)
 """
 
 
-# Set HELPER_PID, CLIENT_PID and WORKER_PID before this source. An in-group helper SIGTSTPs the
-# worker during the cycle, then sleeps; the client records the worker's pid and exits after 2 s.
+# Set HELPER_PID, CLIENT_PID, WORKER_PID and SIGNALS (names) before this source. An in-group
+# helper sends the worker each of SIGNALS in turn during the cycle, then sleeps; the client
+# records the worker's pid and exits after 2 s.
 SIGTSTP_CLIENT = r"""
 import os, signal, time
 worker = os.getppid()
@@ -397,7 +399,9 @@ if os.fork() == 0:
     with open(HELPER_PID, "w") as f:
         f.write(str(os.getpid()))
     time.sleep(0.3)
-    os.kill(worker, signal.SIGTSTP)
+    for name in SIGNALS:
+        os.kill(worker, getattr(signal, name))
+        time.sleep(0.2)
     time.sleep(30)
     os._exit(0)
 with open(CLIENT_PID, "w") as f:
@@ -442,16 +446,22 @@ class DeferredSignalFromTheGroup(unittest.TestCase):
         self.assertEqual(code, 2, output)
         self.assertEqual(report["setup_error"], f"W0: worker exited -{signum}: killed by signal {signum}", output)
 
-    def test_sigtstp_from_the_group_is_deferred_until_the_group_is_killed(self):
-        # The run gets its own process group in this session, so the group is not orphaned and
-        # SIGTSTP really stops (an orphaned group's stop signals are discarded by the kernel).
-        # Deferred: the client's group is killed first; the re-delivered SIGTSTP then stops the
-        # worker, and the parent's WORKER_TIMEOUT (8 s here) kills it.
+    STOP_LINE = "stop signal during the client cycle not re-delivered: SIGTSTP"
+
+    def run_signals(self, *signals: str) -> tuple[int, dict | None, str]:
+        """Run W0 with SIGTSTP_CLIENT sending `signals`; assert the client's group and the worker
+        are gone afterwards. The run gets its own process group in this session, so the group is
+        not orphaned and a stop signal re-delivered to the worker would really stop it (the
+        kernel discards stop signals to an orphaned group); WORKER_TIMEOUT is 8 s, so such a
+        stop fails the test in seconds rather than minutes."""
         tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-sclient-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         script = tmp / "client.py"
         names = ("helper.pid", "client.pid", "worker.pid")
-        script.write_text("".join(f"{n.split('.')[0].upper()}_PID = {str(tmp / n)!r}\n" for n in names) + SIGTSTP_CLIENT)
+        script.write_text(
+            "".join(f"{n.split('.')[0].upper()}_PID = {str(tmp / n)!r}\n" for n in names)
+            + f"SIGNALS = {list(signals)!r}\n" + SIGTSTP_CLIENT
+        )
         out = tmp / "report.json"
         before = self.w0_dirs()
         cmd = [sys.executable, "-B", "-c", SHORT_TIMEOUT_RUN, "run", "--upstream", str(TREE),
@@ -467,8 +477,27 @@ class DeferredSignalFromTheGroup(unittest.TestCase):
             if was_alive:  # never leave it behind (stopped or not); never signal a pid seen dead
                 self.addCleanup(kill_quietly, pid)
         self.assertEqual(seen, {helper: False, client: False, worker: False}, output)
-        self.assertEqual(proc.returncode, 2, output)
-        self.assertEqual(report["setup_error"], "W0: worker did not finish within 8s", output)
+        return proc.returncode, report, output
+
+    def test_sigtstp_from_the_group_is_deferred_and_dropped(self):
+        # Deferred, then dropped with a kit line: the run gives the verdict it would have given
+        # without the signal (this client posts nothing: W0 FAIL), not a stall to the timeout.
+        code, report, output = self.run_signals("SIGTSTP")
+        self.assertIn(code, (0, 1), output)
+        self.assertIsNone(report["setup_error"], output)
+        self.assertIn(self.STOP_LINE, output)
+
+    def test_stop_then_sigterm_ends_by_sigterm(self):
+        code, report, output = self.run_signals("SIGTSTP", "SIGTERM")
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -15: killed by signal 15", output)
+        self.assertIn(self.STOP_LINE, output)
+
+    def test_sigint_then_stop_ends_by_sigint(self):
+        code, report, output = self.run_signals("SIGINT", "SIGTSTP")
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -2: killed by signal 2", output)
+        self.assertIn(self.STOP_LINE, output)
 
     def test_sigalrm_from_the_group_is_deferred_until_the_group_is_killed(self):
         self.check_deferred("signal.SIGALRM", int(signal.SIGALRM))

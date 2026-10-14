@@ -15,6 +15,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -167,7 +168,8 @@ def client_env(contract: dict[str, str]) -> dict[str, str]:
 # The asynchronous, catchable signals that end or stop a process by default (SIGINT: by
 # KeyboardInterrupt), by name where the platform has them, plus every real-time signal and every
 # unnamed number below SIGRTMIN. A client can send them to its worker; during a cycle they are
-# recorded and re-delivered after the group kill. `run_client` tries each one: a number the
+# recorded, and after the group kill the terminating ones are re-delivered and the stop signals
+# (STOP_SIGNALS) are dropped, with a kit line on stderr. `run_client` tries each one: a number the
 # platform refuses a handler for (EINVAL, or ValueError) is skipped and added to UNDEFERRABLE;
 # these are the signals reserved by the C library (32 and 33 on glibc). Not here: SIGKILL and
 # SIGSTOP (cannot be caught), and the fault signals SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP,
@@ -191,6 +193,9 @@ def _deferred_signals() -> tuple[int, ...]:
 
 DEFERRED_SIGNALS = _deferred_signals()  # the candidates; minus UNDEFERRABLE, the deferred set
 UNDEFERRABLE: set[int] = set()  # candidates the platform refused a handler for, as found
+# Recorded like the others but never re-delivered: stopping the worker after the cycle would only
+# stall the run until WORKER_TIMEOUT, and could hide a terminating signal recorded with it.
+STOP_SIGNALS = frozenset(int(getattr(signal, n)) for n in ("SIGTSTP", "SIGTTIN", "SIGTTOU") if hasattr(signal, n))
 
 
 def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
@@ -203,10 +208,11 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
 
     While the cycle runs, the asynchronous terminating and stop signals in `DEFERRED_SIGNALS`
     (which a client can send to this process) are only recorded. After the group kill and the
-    reap, the previous handlers come back (SIGINT's last) and each recorded signal is
+    reap, the previous handlers come back (SIGINT's last) and each recorded terminating signal is
     re-delivered once, in the order this process handled them (not necessarily the order they
-    were sent), so this process then ends or stops as it would have, but only after the client's
-    group is dead. Not deferred: SIGKILL and SIGSTOP, which cannot be caught; the fault signals
+    were sent), so this process then ends as it would have, but only after the client's group is
+    dead. A recorded stop signal (`STOP_SIGNALS`) is dropped, with a kit line on stderr naming
+    it. Not deferred: SIGKILL and SIGSTOP, which cannot be caught; the fault signals
     SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS; and the signals reserved by the
     C library (32 on glibc), which refuse a handler (`UNDEFERRABLE`). A client that sends one of
     those can still end (or stop) this worker before the kill and leave its group alive.
@@ -256,13 +262,19 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
         for sig in sorted(previous, key=lambda s: s == signal.SIGINT):
             handler = previous[sig]
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
-        _redeliver(arrived)
+        dropped = [sig for sig in dict.fromkeys(arrived) if sig in STOP_SIGNALS]
+        if dropped:
+            names = ", ".join(signal.Signals(sig).name for sig in dropped)
+            sys.stderr.write(f"stop signal during the client cycle not re-delivered: {names}\n")
+            sys.stderr.flush()
+        _redeliver([sig for sig in arrived if sig not in STOP_SIGNALS])
     return exit_code, timed_out
 
 
 def _redeliver(arrived: list[int]) -> None:
-    """Send each recorded signal once more to this process, in arrival order, now that the
-    client's group is dead and the previous handlers are back. A default-terminating one ends
+    """Send each recorded signal once more to this process, in the order this process handled
+    them (not necessarily the order they were sent), now that the client's group is dead and
+    the previous handlers are back. A default-terminating one ends
     the process here; an exception a handler raises (KeyboardInterrupt) goes on after the rest
     were re-delivered."""
     raised: BaseException | None = None

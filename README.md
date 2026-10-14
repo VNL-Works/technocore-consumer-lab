@@ -112,16 +112,16 @@ scenario precondition that did not hold, S and W ids mixed in one run: the two c
 differ). The JSON report has sorted keys, the upstream commit (or `"unknown"`), each verdict and
 its reason, and event counts; writer results add `outcome`, `stored`, `other_records` (other
 non-seed records the client posted) and the proxy's log, whose paths and methods appear only
-in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client
-whose processes all end with its cycle (its group is killed after every cycle, even if the wait
-raises; asynchronous terminating and stop signals to the worker act only after it), the report
-holds no record texts or client strings from events, client integers appear in reasons only
-within 64-bit range (else `a large integer`), and `setup_error` holds only kit text; a bad worker
-result is a setup error (exit 2). Only the last 1 MiB of each worker stream is read; kit stderr
-echoes it. `--keep-root` never writes `result.json` through a link or over an existing entry. Not
-a sandbox: a client runs as the kit's user; a `setsid` escapee can outlive the run and write the
-worker's output; SIGKILL, SIGSTOP, fault signals (SEGV, BUS, FPE, ILL, TRAP, ABRT, SYS) and signals
-reserved by the C library (32 on glibc) are not deferred and can end or stop the worker before the kill.
+in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client whose
+processes all end with its cycle (its group is killed after every cycle, even if the wait raises;
+asynchronous terminating signals to the worker act only after it; stop signals (TSTP, TTIN, TTOU) sent
+during a cycle are dropped, with a kit line), the report holds no record texts or client strings from
+events, client integers appear in reasons only within 64-bit range (else `a large integer`), and
+`setup_error` holds only kit text; a bad worker result is a setup error (exit 2). Only the last 1 MiB
+of each worker stream is read; kit stderr echoes it. `--keep-root` never writes `result.json` through
+a link or over an existing entry. Not a sandbox (same user): a `setsid` escapee can outlive the run
+and write worker output; SIGKILL, SIGSTOP, fault signals (SEGV, BUS, FPE, ILL, TRAP, ABRT, SYS) and
+signals reserved by the C library (32 on glibc) are not deferred and can end or stop the worker first.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
