@@ -9,6 +9,7 @@ Private upstream calls used (pinned at upstream commit 0e47f77; see server.PINNE
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
@@ -163,26 +164,33 @@ def client_env(contract: dict[str, str]) -> dict[str, str]:
     }
 
 
-# The asynchronous, catchable signals that end a process by default (SIGINT: by
-# KeyboardInterrupt), by name where the platform has them, plus every real-time signal. A client
-# can send them to its worker; during a cycle they are recorded and re-delivered after the group
-# kill. Not here: SIGKILL and SIGSTOP (cannot be caught), and the fault signals SIGSEGV, SIGBUS,
-# SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS (a real fault under a recording handler could loop
-# or hide a crash); any of those can still end (or stop) the worker before the group kill.
+# The asynchronous, catchable signals that end or stop a process by default (SIGINT: by
+# KeyboardInterrupt), by name where the platform has them, plus every real-time signal and every
+# unnamed number below SIGRTMIN. A client can send them to its worker; during a cycle they are
+# recorded and re-delivered after the group kill. `run_client` tries each one: a number the
+# platform refuses a handler for (EINVAL, or ValueError) is skipped and added to UNDEFERRABLE;
+# these are the signals reserved by the C library (32 and 33 on glibc). Not here: SIGKILL and
+# SIGSTOP (cannot be caught), and the fault signals SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP,
+# SIGABRT and SIGSYS (a real fault under a recording handler could loop or hide a crash). Those,
+# and the C library's reserved signals, can still end (or stop) the worker before the group kill.
 _DEFERRED_NAMES = (
     "SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2",
     "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGIO", "SIGPOLL", "SIGPWR", "SIGSTKFLT",
+    "SIGTSTP", "SIGTTIN", "SIGTTOU",
 )
 
 
 def _deferred_signals() -> tuple[int, ...]:
     sigs = [int(getattr(signal, name)) for name in _DEFERRED_NAMES if hasattr(signal, name)]
     if hasattr(signal, "SIGRTMIN") and hasattr(signal, "SIGRTMAX"):
+        named = {int(s) for s in signal.Signals}
+        sigs += [n for n in range(1, int(signal.SIGRTMIN)) if n not in named]  # e.g. 32, 33 on Linux
         sigs += range(int(signal.SIGRTMIN), int(signal.SIGRTMAX) + 1)
     return tuple(dict.fromkeys(sigs))  # SIGIO and SIGPOLL can be one number
 
 
-DEFERRED_SIGNALS = _deferred_signals()
+DEFERRED_SIGNALS = _deferred_signals()  # the candidates; minus UNDEFERRABLE, the deferred set
+UNDEFERRABLE: set[int] = set()  # candidates the platform refused a handler for, as found
 
 
 def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
@@ -193,13 +201,15 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
     when the wait raises, so a helper the client started in its group cannot keep running into
     the next step (a process that left the group, e.g. via `setsid`, is not reached).
 
-    While the cycle runs, the asynchronous terminating signals in `DEFERRED_SIGNALS` (which a
-    client can send to this process) are only recorded. After the group kill and the reap, the
-    previous handlers come back and each recorded signal is re-delivered once, in arrival order,
-    so this process then ends as it would have, but only after the client's group is dead. Not
-    deferred: SIGKILL and SIGSTOP, which cannot be caught, and the fault signals SIGSEGV, SIGBUS,
-    SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS; a client that sends one of those can still end
-    (or stop) this worker before the kill and leave its group alive.
+    While the cycle runs, the asynchronous terminating and stop signals in `DEFERRED_SIGNALS`
+    (which a client can send to this process) are only recorded. After the group kill and the
+    reap, the previous handlers come back (SIGINT's last) and each recorded signal is
+    re-delivered once, in the order this process handled them (not necessarily the order they
+    were sent), so this process then ends or stops as it would have, but only after the client's
+    group is dead. Not deferred: SIGKILL and SIGSTOP, which cannot be caught; the fault signals
+    SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS; and the signals reserved by the
+    C library (32 on glibc), which refuse a handler (`UNDEFERRABLE`). A client that sends one of
+    those can still end (or stop) this worker before the kill and leave its group alive.
     Must run on the main thread (Python handlers are set and run there), else a SetupError.
     """
     if threading.current_thread() is not threading.main_thread():
@@ -207,12 +217,16 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
     arrived: list[int] = []
     previous: dict[int, object] = {}
     try:
-        try:
-            for sig in DEFERRED_SIGNALS:
+        for sig in DEFERRED_SIGNALS:
+            try:
                 # Minimal on purpose: runs on the main thread between bytecodes, at any point.
                 previous[sig] = signal.signal(sig, lambda signum, _frame: arrived.append(signum))
-        except ValueError as exc:  # signal.signal off the main thread
-            raise SetupError(f"cannot defer the client's signals: {exc}") from exc
+            except ValueError:  # not a signal Python can handle here (the thread was checked)
+                UNDEFERRABLE.add(sig)
+            except OSError as exc:
+                if exc.errno != errno.EINVAL:
+                    raise SetupError(f"cannot defer signal {sig}: {exc.strerror}") from exc
+                UNDEFERRABLE.add(sig)  # reserved by the C library (32 on glibc)
         try:
             with open(stderr_path, "ab") as stderr:
                 proc = subprocess.Popen(
@@ -237,7 +251,10 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
                 pass  # the group is already empty (or its id now belongs to someone else)
             proc.wait()
     finally:
-        for sig, handler in previous.items():
+        # SIGINT's handler last: a SIGINT arriving mid-restore is still only recorded until
+        # every other handler is back.
+        for sig in sorted(previous, key=lambda s: s == signal.SIGINT):
+            handler = previous[sig]
             signal.signal(sig, signal.SIG_DFL if handler is None else handler)
         _redeliver(arrived)
     return exit_code, timed_out

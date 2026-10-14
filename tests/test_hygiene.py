@@ -8,9 +8,9 @@
 - v0.2.4: with `--keep-root`, result.json is never written through a link the client planted
   or into a workdir it swapped for a link, and the parent says when it did not write one
   (silent only for the worker's own file after exit -2); the asynchronous terminating signals
-  a client sends its worker (SIGTERM, SIGALRM, a real-time signal, or a SIGINT that lands just
-  before the kill) are deferred until the group is killed; `run_client` off the main thread is
-  a setup error.
+  and stop signals a client sends its worker (SIGTERM, SIGALRM, SIGTSTP, a real-time signal, or
+  a SIGINT that lands just before the kill) are deferred until the group is killed, and SIGINT's
+  handler is restored last; `run_client` off the main thread is a setup error.
 """
 
 import contextlib
@@ -386,6 +386,34 @@ time.sleep(2)
 """
 
 
+# Set HELPER_PID, CLIENT_PID and WORKER_PID before this source. An in-group helper SIGTSTPs the
+# worker during the cycle, then sleeps; the client records the worker's pid and exits after 2 s.
+SIGTSTP_CLIENT = r"""
+import os, signal, time
+worker = os.getppid()
+with open(WORKER_PID, "w") as f:
+    f.write(str(worker))
+if os.fork() == 0:
+    with open(HELPER_PID, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(0.3)
+    os.kill(worker, signal.SIGTSTP)
+    time.sleep(30)
+    os._exit(0)
+with open(CLIENT_PID, "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(2)
+"""
+
+# The parent `run` with a short WORKER_TIMEOUT (as WorkerTimeoutLeavesNoStrayDir patches it).
+SHORT_TIMEOUT_RUN = r"""
+import sys
+from consumer_lab import cli
+cli.WORKER_TIMEOUT = 8
+sys.exit(cli.main(sys.argv[1:]))
+"""
+
+
 @unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
 class DeferredSignalFromTheGroup(unittest.TestCase):
     w0_dirs = SignalledWorker.w0_dirs
@@ -413,6 +441,34 @@ class DeferredSignalFromTheGroup(unittest.TestCase):
         self.assertEqual(seen, {pid: False for pid in pids}, output)
         self.assertEqual(code, 2, output)
         self.assertEqual(report["setup_error"], f"W0: worker exited -{signum}: killed by signal {signum}", output)
+
+    def test_sigtstp_from_the_group_is_deferred_until_the_group_is_killed(self):
+        # The run gets its own process group in this session, so the group is not orphaned and
+        # SIGTSTP really stops (an orphaned group's stop signals are discarded by the kernel).
+        # Deferred: the client's group is killed first; the re-delivered SIGTSTP then stops the
+        # worker, and the parent's WORKER_TIMEOUT (8 s here) kills it.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-sclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        script = tmp / "client.py"
+        names = ("helper.pid", "client.pid", "worker.pid")
+        script.write_text("".join(f"{n.split('.')[0].upper()}_PID = {str(tmp / n)!r}\n" for n in names) + SIGTSTP_CLIENT)
+        out = tmp / "report.json"
+        before = self.w0_dirs()
+        cmd = [sys.executable, "-B", "-c", SHORT_TIMEOUT_RUN, "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", "W0", "--json", str(out)]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=120, process_group=0)
+        for name in self.w0_dirs() - before:
+            self.addCleanup(shutil.rmtree, Path(tempfile.gettempdir()) / name, True)
+        output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        report = json.loads(out.read_text()) if out.exists() else None
+        helper, client, worker = (int((tmp / n).read_text()) for n in names)
+        seen = {pid: alive(pid) for pid in (helper, client, worker)}
+        for pid, was_alive in seen.items():
+            if was_alive:  # never leave it behind (stopped or not); never signal a pid seen dead
+                self.addCleanup(kill_quietly, pid)
+        self.assertEqual(seen, {helper: False, client: False, worker: False}, output)
+        self.assertEqual(proc.returncode, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker did not finish within 8s", output)
 
     def test_sigalrm_from_the_group_is_deferred_until_the_group_is_killed(self):
         self.check_deferred("signal.SIGALRM", int(signal.SIGALRM))
@@ -471,6 +527,28 @@ class RunClientDefersSignals(unittest.TestCase):
             self.addCleanup(kill_quietly, pid)
         self.assertFalse(helper_alive, f"helper {pid} outlived the cycle")
         self.assertIs(signal.getsignal(signal.SIGINT), before)  # the previous handler is back
+
+    def test_sigint_handler_is_restored_last(self):
+        # A SIGINT arriving mid-restore must find every other handler already back.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        real_signal = signal.signal
+        installs: list[int] = []
+
+        def logging_signal(sig, handler):
+            previous = real_signal(sig, handler)  # a refused number raises before it is logged
+            installs.append(int(sig))
+            return previous
+
+        before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)}
+        with mock.patch.object(signal, "signal", side_effect=logging_signal):
+            run_client(["true"], dict(os.environ), tmp / "client.stderr", 10.0)
+        set_ = len(installs) // 2  # every handler is set once, then restored once
+        self.assertEqual(len(installs), 2 * set_)
+        restores = installs[set_:]
+        self.assertEqual(restores[-1], int(signal.SIGINT), restores)
+        self.assertEqual(sorted(restores), sorted(installs[:set_]))
+        self.assertEqual({s: signal.getsignal(s) for s in before}, before)
 
     def test_off_the_main_thread_is_a_setup_error(self):
         from consumer_lab.server import SetupError
