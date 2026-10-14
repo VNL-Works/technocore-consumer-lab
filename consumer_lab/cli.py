@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -95,15 +96,17 @@ def _workdir(args, sid: str) -> Path:
     return Path(args.workdir) if args.workdir else _new_workdir(sid)
 
 
-def _write_kept_result(workdir: Path, outcome: dict) -> None:
+def _write_kept_result(workdir: Path, outcome: dict, quiet_if_regular: bool = False) -> bool:
     """Write `outcome` to <workdir>/result.json for `--keep-root`, never through a link.
 
     The client can create, rename and replace entries in its workdir (it knows the path from
     TC_EVENTS), so: the workdir is opened without following a symlink, and result.json is
     created relative to it, exclusively and without following one. If the workdir was replaced
     or result.json already exists in any form, nothing is written, overwritten, followed or
-    deleted; a fixed kit line says so. (The workdir's parent, the system temp dir, is not
-    defended.)"""
+    deleted, and a fixed kit line says so; except, with `quiet_if_regular` (the parent's call),
+    when result.json already exists as a regular file (the worker's own, or the client's):
+    then nothing is printed and False is returned. Otherwise True. (The workdir's parent, the
+    system temp dir, is not defended.)"""
     text = json.dumps(outcome, sort_keys=True, indent=2) + "\n"
     dir_fd = None
     try:
@@ -112,8 +115,15 @@ def _write_kept_result(workdir: Path, outcome: dict) -> None:
             "result.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
         )
     except OSError:
+        if quiet_if_regular and dir_fd is not None:
+            try:
+                existing = os.lstat("result.json", dir_fd=dir_fd)  # never follows
+            except OSError:
+                existing = None
+            if existing is not None and stat.S_ISREG(existing.st_mode):
+                return False
         print(f"not writing result.json in {workdir}: it was replaced or already exists", file=sys.stderr)
-        return
+        return True
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
@@ -122,6 +132,7 @@ def _write_kept_result(workdir: Path, outcome: dict) -> None:
             f.write(text)
     except OSError:
         pass  # a full disk, say: the kept dir stays, without a complete result.json
+    return True
 
 
 def _print_result(result: dict) -> None:
@@ -313,9 +324,12 @@ def _worker_result(stdout: str) -> dict | None:
 
 
 def _keep_result_json(workdir: Path, sid: str, setup_error: str) -> None:
-    """`--keep-root` for a worker that could not write its own result.json."""
-    _write_kept_result(workdir, {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error})
-    print(f"kept {workdir}", file=sys.stderr)
+    """`--keep-root` for a worker that could not write its own result.json. A regular
+    result.json already there (the worker's own, which then printed `kept` itself) is left as
+    it is, silently, with no second `kept` line."""
+    outcome = {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error}
+    if _write_kept_result(workdir, outcome, quiet_if_regular=True):
+        print(f"kept {workdir}", file=sys.stderr)
 
 
 def _tail(f) -> tuple[str, int]:

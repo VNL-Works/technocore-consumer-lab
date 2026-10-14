@@ -338,6 +338,28 @@ class DeferredSignalFromTheGroup(unittest.TestCase):
         self.assertEqual(code, 2, output)
         self.assertEqual(report["setup_error"], "W0: worker exited -15: killed by signal 15", output)
 
+    def test_sigint_with_keep_root_keeps_the_workers_own_result_with_one_kept_line(self):
+        # The worker writes its own result.json (KeyboardInterrupt); the parent's O_EXCL create
+        # then finds a regular file and stays silent: one `kept` line, no `not writing` line.
+        source = SIGTERM_CLIENT.replace("signal.SIGTERM", "signal.SIGINT").replace("SIGTERMs", "SIGINTs")
+        code, report, output, tmp = self.run_kit(source, "--keep-root")
+        pids = [int((tmp / name).read_text()) for name in ("helper.pid", "client.pid")]
+        seen = {pid: alive(pid) for pid in pids}
+        for pid, was_alive in seen.items():
+            if was_alive:  # never leave it behind; never signal a pid already seen dead
+                self.addCleanup(kill_quietly, pid)
+        kept = [ln.removeprefix("kept ") for ln in output.splitlines() if ln.startswith("kept ")]
+        for d in set(kept):
+            self.addCleanup(shutil.rmtree, d, True)
+        self.assertEqual(seen, {pid: False for pid in pids}, output)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -2: killed by signal 2", output)
+        self.assertEqual(len(kept), 1, output)
+        self.assertFalse([ln for ln in output.splitlines() if ln.startswith("not writing result.json")], output)
+        result_json = Path(kept[0]) / "result.json"
+        self.assertFalse(result_json.is_symlink())
+        self.assertEqual(json.loads(result_json.read_text()), {"error": "KeyboardInterrupt()", "exit_code": 1, "id": "W0"})
+
 
 @unittest.skipUnless(hasattr(os, "killpg") and Path("/proc").is_dir(), "needs POSIX process groups and /proc")
 class RunClientDefersSignals(unittest.TestCase):
