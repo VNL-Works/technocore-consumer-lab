@@ -113,15 +113,15 @@ differ). The JSON report has sorted keys, the upstream commit (or `"unknown"`), 
 its reason, and event counts; writer results add `outcome`, `stored`, `other_records` (other
 non-seed records the client posted) and the proxy's log, whose paths and methods appear only
 in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client
-whose processes all end with its cycle (the kit kills the client's process group after every
-cycle, also when an exception interrupts the worker's wait), the report holds no record texts
-and no client strings from events, a client's integers appear in reasons only within 64-bit
-range (else as `a large integer`), and `setup_error` holds only kit-written text. A worker
-result the kit cannot parse is a setup error (exit 2), not a crash. The kit's own stderr may
-include whatever the worker and the client printed. The kit is not a sandbox: a client runs as
-the same user as the kit; a process that leaves the client's group (via `setsid`, say), or a
-client whose worker was killed outright by a signal, can outlive the run, and the former can
-still write the worker's output, and with it `setup_error` or a whole scenario result.
+whose processes all end with its cycle (its group is killed after every cycle, even if the wait
+raises; signals to the worker other than SIGKILL and SIGSTOP act only after that kill), the
+report holds no record texts or client strings from events, client integers appear in reasons
+only within 64-bit range (else `a large integer`), and `setup_error` holds only kit text; an
+unparsable worker result is a setup error (exit 2). Only the last 1 MiB of each worker stream is
+read; the kit's stderr may show what worker and client printed. `--keep-root` never writes
+`result.json` through a link or over an existing entry. Not a sandbox: a client runs as the
+kit's user; a process that leaves its group (`setsid`) or a client whose worker got SIGKILL can
+outlive the run, and the former can still write the worker's output, `setup_error` and results.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
