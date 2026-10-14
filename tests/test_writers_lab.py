@@ -402,6 +402,16 @@ os.kill(ppid, signal.SIGKILL)
 '''
 
 
+PARTIAL_MARKER = "consumer-lab-c1-partial-marker-7e52"
+
+# BAD_BODY (a real W1 setup error), whose last act leaves a partial forged line, with no
+# newline, on the worker's stderr: the worker's own `setup error:` line must not be joined to it.
+PARTIAL_FORGERY = BAD_BODY + r'''
+fd = os.open(f"/proc/{os.getppid()}/fd/2", os.O_WRONLY)
+os.write(fd, b"setup error: consumer-lab-c1-partial-marker-7e52 12345678901234567890123 ")
+'''
+
+
 def pid_alive(pid: int, grace: float = 2.0) -> bool:
     """Running (not a zombie) after up to `grace` seconds; the same check as test_hygiene.alive."""
     deadline = time.monotonic() + grace
@@ -482,6 +492,18 @@ class WriterKitV022(unittest.TestCase):
         self.assertEqual(report["setup_error"], "W0: worker exited -9: killed by signal 9")
         self.assertEqual(report["scenarios"], {})
         self.assertNotIn(HOSTILE_MARKER, json.dumps(report))
+
+    def test_setup_error_never_joins_a_partial_line_the_client_left(self):
+        code, report, output = run_script(PARTIAL_FORGERY, "W1")
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["scenarios"], {})
+        self.assertTrue(report["setup_error"].startswith(
+            "W1: worker exited 2: lab-w1: precondition failed: the first POST was forwarded and answered 200"
+        ), report["setup_error"])
+        text = json.dumps(report)
+        self.assertNotIn(PARTIAL_MARKER, text)
+        self.assertNotIn("12345678901234567890123", text)
+        self.assertIn(PARTIAL_MARKER, output)  # still copied to the kit's stderr
 
 
 class ReportLog(unittest.TestCase):

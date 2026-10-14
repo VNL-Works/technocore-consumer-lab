@@ -346,5 +346,9 @@ def main(argv: list[str] | None = None) -> int:
             return _worker(args)
         return _run(args)
     except SetupError as exc:
+        if args.command == "_worker":
+            # The client shares this stderr: start a fresh line, so that a partial line it left
+            # cannot become the start of the line `_worker_failure` reads.
+            sys.stderr.write("\n")
         print(f"setup error: {exc}", file=sys.stderr)
         return EXIT_SETUP

@@ -112,11 +112,14 @@ scenario precondition that did not hold, S and W ids mixed in one run: the two c
 differ). The JSON report has sorted keys, the upstream commit (or `"unknown"`), each verdict and
 its reason, and event counts; writer results add `outcome`, `stored`, `other_records` (other
 non-seed records the client posted) and the proxy's log, whose paths and methods appear only
-in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). The report
-holds no record texts and no client strings from events; a client's integers appear in reasons
+in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client
+whose processes all end with its cycle (the kit kills the client's process group), the report
+holds no record texts and no client strings from events, a client's integers appear in reasons
 only within 64-bit range (else as `a large integer`), and `setup_error` holds only kit-written
 text. The kit's own stderr may include whatever the worker and the client printed. The kit is
-not a sandbox: a client runs as the same user as the kit.
+not a sandbox: a client runs as the same user as the kit, and a process that leaves the client's
+group (via `setsid`, say) can still write the worker's output, and with it `setup_error` or a
+whole scenario result.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
