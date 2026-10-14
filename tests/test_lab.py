@@ -116,6 +116,14 @@ sys.argv = [CAREFUL]
 runpy.run_path(CAREFUL, run_name="__main__")
 '''
 
+NESTED = r'''
+import os
+# A line of 200000 "[": json.loads raises RecursionError (not ValueError) on it. The kit must
+# judge it as a malformed line (FAIL:bad_events), not stop with a setup error.
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write("[" * 200000 + "\n")
+'''
+
 
 def run_script_client(source: str, scenario: str, *extra: str) -> tuple[int, dict | None, str]:
     with tempfile.TemporaryDirectory(prefix="consumer-lab-client-") as tmp:
@@ -164,6 +172,16 @@ class KitHardening(unittest.TestCase):
         self.assertEqual(result["verdict"], "FAIL:missed_retained")
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["cycle_exit_codes"], [0, 0])
+
+    def test_deeply_nested_line_is_bad_events(self):
+        code, report, output = run_script_client(NESTED, "S1")
+        self.assertEqual(code, 1, output)
+        self.assertIsNone(report["setup_error"], output)
+        self.assertEqual(verdicts(report)["S1"], "FAIL:bad_events", output)
+        self.assertEqual(report["scenarios"]["S1"]["reason"], "S1: malformed event log, line 1 is not JSON")
+        events = report["scenarios"]["S1"]["events"]
+        self.assertEqual((events["deliver"], events["loss"]), (0, 0), output)
+        self.assertEqual(events["other"], events["total"], output)  # each line counted malformed
 
     def test_json_into_missing_dir_exits_2(self):
         with tempfile.TemporaryDirectory() as tmp:

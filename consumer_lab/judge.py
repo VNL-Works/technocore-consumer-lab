@@ -103,13 +103,19 @@ def parse_events(lines: list[str]) -> tuple[list[dict], str | None]:
             continue
         try:
             ev = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested too deeply
             return events, f"line {n} is not JSON"
         err = validate_event(ev)
         if err:
             return events, f"line {n}: {err}"
         events.append(ev)
     return events, None
+
+
+def shown_int(value: int) -> str:
+    """A client-chosen integer as a reason may print it: its digits only within 64-bit range,
+    since a longer one could encode any text the client chose (a reason reaches the report)."""
+    return str(value) if -(2**63) <= value < 2**63 else "a large integer"
 
 
 def json_type(ev: dict, key: str) -> str:
@@ -196,26 +202,31 @@ def judge(
         if key in truth.lost:
             return Verdict(
                 FAIL_DELIVERED_LOST,
-                f"{scenario}: delivered seq {key[1]} (generation {key[0]}), which was not retained",
+                f"{scenario}: delivered seq {shown_int(key[1])} (generation {shown_int(key[0])}), "
+                "which was not retained",
             )
         if key not in expected_set:
             return Verdict(
                 FAIL_DELIVERED_LOST,
-                f"{scenario}: delivered seq {key[1]} as generation {key[0]}, "
+                f"{scenario}: delivered seq {shown_int(key[1])} as generation {shown_int(key[0])}, "
                 "a record the store never held under that generation",
             )
 
     seen: set[Key] = set()
     for _, key in deliveries:
         if key in seen:
-            return Verdict(FAIL_DUPLICATE, f"{scenario}: seq {key[1]} (generation {key[0]}) delivered twice")
+            return Verdict(
+                FAIL_DUPLICATE,
+                f"{scenario}: seq {shown_int(key[1])} (generation {shown_int(key[0])}) delivered twice",
+            )
         seen.add(key)
 
     rank = {key: n for n, key in enumerate(expected)}
     for (_, prev), (_, key) in zip(deliveries, deliveries[1:]):
         if rank[key] < rank[prev]:
             return Verdict(
-                FAIL_OUT_OF_ORDER, f"{scenario}: seq {key[1]} delivered after seq {prev[1]}"
+                FAIL_OUT_OF_ORDER,
+                f"{scenario}: seq {shown_int(key[1])} delivered after seq {shown_int(prev[1])}",
             )
 
     def opens_at(gap: Gap) -> int:
@@ -236,8 +247,8 @@ def judge(
             )
             return Verdict(
                 FAIL_BAD_EVENTS,
-                f"{scenario}: loss after_seq={gap.after_seq} reported in cycle {cycle_no}, before "
-                f"the gap was observable (cycle {gap.observable_cycle + 1})",
+                f"{scenario}: loss after_seq={shown_int(gap.after_seq)} reported in cycle {cycle_no}, "
+                f"before the gap was observable (cycle {gap.observable_cycle + 1})",
             )
 
     for gap in truth.gaps:
@@ -258,12 +269,13 @@ def judge(
             want = f" with a reason containing one of {list(gap.reason_any)}" if gap.reason_any else ""
             return Verdict(
                 FAIL_UNREPORTED_LOSS,
-                f"{scenario}: no loss event with after_seq={gap.after_seq}{want}",
+                f"{scenario}: no loss event with after_seq={shown_int(gap.after_seq)}{want}",
             )
         if first_past is not None and matching[0] > first_past:
             return Verdict(
                 FAIL_UNREPORTED_LOSS,
-                f"{scenario}: loss after_seq={gap.after_seq} reported only after delivering past the gap",
+                f"{scenario}: loss after_seq={shown_int(gap.after_seq)} reported only after delivering "
+                "past the gap",
             )
 
     missed = [key for key in expected if key not in seen]
@@ -281,7 +293,7 @@ def judge(
             # malformed log, because the log asserts a loss the kit knows did not happen.
             return Verdict(
                 FAIL_BAD_EVENTS,
-                f"{scenario}: loss reported after_seq={ev['after_seq']}, where no record was lost",
+                f"{scenario}: loss reported after_seq={shown_int(ev['after_seq'])}, where no record was lost",
             )
 
     return Verdict(

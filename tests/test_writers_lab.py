@@ -219,6 +219,10 @@ class WriterKit(unittest.TestCase):
         self.assertIn("precondition failed: the first POST was forwarded and answered 200", output)
         self.assertEqual(report["scenarios"], {})
         self.assertIsNotNone(report["setup_error"])
+        # The worker's own `setup error:` line is the detail.
+        self.assertTrue(report["setup_error"].startswith(
+            "W1: worker exited 2: lab-w1: precondition failed: the first POST was forwarded and answered 200"
+        ), report["setup_error"])
 
     def test_log_changed_after_cycle_is_bad_events(self):
         code, report, output = run_script(LATE_APPEND, "W3")
@@ -371,6 +375,33 @@ with open(os.environ["TC_EVENTS"], "a") as f:
 '''
 
 
+NESTED = r'''
+import os
+# A line of 200000 "[": json.loads raises RecursionError (not ValueError) on it. The kit must
+# judge it as a malformed line (FAIL:bad_events), not stop with a setup error.
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write("[" * 200000 + "\n")
+'''
+
+HOSTILE_MARKER = "consumer-lab-c1-hostile-marker-3d81"
+
+# Set CHECK before this source: the path where the client records who its parent is.
+HOSTILE = r'''
+import json, os, signal
+# A hostile client: it writes a marker (also as a forged "setup error:" line) to its parent's
+# stderr, then SIGKILLs the parent. The report's setup_error must hold only kit text.
+MARKER = "consumer-lab-c1-hostile-marker-3d81"
+ppid = os.getppid()
+with open(f"/proc/{ppid}/cmdline", "rb") as f:
+    argv = f.read().split(b"\0")
+with open(CHECK, "w") as f:
+    json.dump({"ppid": ppid, "parent_is_worker": b"_worker" in argv and b"consumer_lab" in argv}, f)
+with open(f"/proc/{ppid}/fd/2", "w") as f:
+    f.write(MARKER + "\n" + "setup error: " + MARKER + "\n")
+os.kill(ppid, signal.SIGKILL)
+'''
+
+
 def pid_alive(pid: int, grace: float = 2.0) -> bool:
     """Running (not a zombie) after up to `grace` seconds; the same check as test_hygiene.alive."""
     deadline = time.monotonic() + grace
@@ -427,6 +458,30 @@ class WriterKitV021(unittest.TestCase):
         text = json.dumps(report)
         self.assertIsNone(re.search(r"\b[0-9a-f]{16}\b", text), text)
         self.assertNotIn("consumer-lab write", text)
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class WriterKitV022(unittest.TestCase):
+    def test_deeply_nested_line_is_bad_events(self):
+        code, report, output = run_script(NESTED, "W0")
+        self.assertEqual(code, 1, output)
+        self.assertIsNone(report["setup_error"], output)
+        self.assertEqual(verdicts(report)["W0"], "FAIL:bad_events", output)
+        self.assertEqual(report["scenarios"]["W0"]["reason"], "W0: line 1 is not JSON")
+        self.assertEqual(report["scenarios"]["W0"]["events"], {"write": 0, "other": 1, "total": 1})
+
+    def test_setup_error_never_carries_what_a_hostile_client_wrote(self):
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hostile-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        check = tmp / "parent.json"
+        code, report, output = run_script(f"CHECK = {str(check)!r}\n" + HOSTILE, "W0")
+        parent = json.loads(check.read_text())
+        self.assertTrue(parent["parent_is_worker"], parent)  # /proc/<ppid>/fd/2 is the worker's stderr
+        self.assertEqual(code, 2, output)
+        self.assertIn(HOSTILE_MARKER, output)  # the worker's stderr is still copied to the kit's
+        self.assertEqual(report["setup_error"], "W0: worker exited -9: killed by signal 9")
+        self.assertEqual(report["scenarios"], {})
+        self.assertNotIn(HOSTILE_MARKER, json.dumps(report))
 
 
 class ReportLog(unittest.TestCase):

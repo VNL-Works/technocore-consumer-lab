@@ -106,6 +106,11 @@ class WriterVerdicts(unittest.TestCase):
         missing_outcome = json.dumps({"event": "write", "id": WID})
         self.assertEqual(self.v([missing_outcome], 1).reason, "W3: line 1: unknown outcome (a missing)")
 
+    def test_bad_events_deeply_nested_json(self):
+        # json.loads raises RecursionError, not ValueError, here: still a verdict, not a crash.
+        r = self.v(["[" * 200000], 1)
+        self.assertEqual((r.verdict, r.reason), (WJ.FAIL_BAD_EVENTS, "W3: line 1 is not JSON"))
+
     def test_bad_events_empty_log_exit_0(self):
         self.assertEqual(self.v([], 1, cycle=cyc(exit_code=0, n=0)).verdict, WJ.FAIL_BAD_EVENTS)
 

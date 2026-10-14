@@ -188,6 +188,48 @@ class JudgeVerdicts(unittest.TestCase):
         self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
         self.assertEqual(v.reason, "SX: malformed event log, line 1: unknown event type (a missing)")
 
+    def test_bad_events_deeply_nested_json(self):
+        # json.loads raises RecursionError, not ValueError, here: still a verdict, not a crash.
+        truth = Truth(expected=[(1, 1)])
+        v = judge("SX", ["[" * 200000], truth, [])
+        self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
+        self.assertEqual(v.reason, "SX: malformed event log, line 1 is not JSON")
+
+    def test_delivered_lost_large_integer_is_capped(self):
+        # A client-chosen integer reaches the reason only up to 64-bit size: a longer one
+        # could carry any text the client chose to encode as digits.
+        truth = Truth(expected=[(1, 1)])
+        big = 10**30
+        v = judge("SX", [d(big)], truth, ok_cycles([d(big)]))
+        self.assertEqual(v.verdict, J.FAIL_DELIVERED_LOST)
+        self.assertIn("a large integer", v.reason)
+        self.assertNotIn(str(big), v.reason)
+        self.assertNotIn("000000000000", v.reason)
+        v = judge("SX", [d(7, big)], truth, ok_cycles([d(7, big)]))
+        self.assertEqual(v.verdict, J.FAIL_DELIVERED_LOST)
+        self.assertEqual(
+            v.reason,
+            "SX: delivered seq 7 as generation a large integer, "
+            "a record the store never held under that generation",
+        )
+        lost = Truth(expected=[(1, 1)], lost={(1, 5)})
+        v = judge("SX", [d(5)], lost, ok_cycles([d(5)]))
+        self.assertEqual(v.reason, "SX: delivered seq 5 (generation 1), which was not retained")
+        # The 64-bit bounds: -(2**63) <= v < 2**63 is printed, anything outside is not.
+        for value, shown in [(2**63 - 1, str(2**63 - 1)), (2**63, "a large integer"),
+                             (-(2**63), str(-(2**63))), (-(2**63) - 1, "a large integer")]:
+            with self.subTest(value=value):
+                v = judge("SX", [d(value)], truth, ok_cycles([d(value)]))
+                self.assertEqual(v.verdict, J.FAIL_DELIVERED_LOST)
+                self.assertTrue(v.reason.startswith(f"SX: delivered seq {shown} as generation 1,"), v.reason)
+
+    def test_bad_events_false_alarm_large_after_seq_is_capped(self):
+        truth = Truth(expected=[(1, 1)])
+        events = [d(1), loss(10**30)]
+        v = judge("SX", events, truth, ok_cycles(events))
+        self.assertEqual(v.verdict, J.FAIL_BAD_EVENTS)
+        self.assertEqual(v.reason, "SX: loss reported after_seq=a large integer, where no record was lost")
+
     def test_bad_events_false_alarm(self):
         truth = Truth(expected=[(1, s) for s in range(1, 4)])
         events = [d(1), loss(1), d(2), d(3)]

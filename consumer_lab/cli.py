@@ -134,7 +134,7 @@ def _worker(args) -> int:
         for line in lines:
             try:
                 kinds[str(json.loads(line).get("event"))] += 1
-            except (ValueError, AttributeError):
+            except (ValueError, RecursionError, AttributeError):
                 kinds["malformed"] += 1
         result = {
             "id": scenario.id,
@@ -204,7 +204,7 @@ def _writer_worker(args, scenario) -> int:
                 continue
             try:
                 kinds[str(json.loads(line).get("event"))] += 1
-            except (ValueError, AttributeError):
+            except (ValueError, RecursionError, AttributeError):
                 kinds["malformed"] += 1
         # Never the write text: only counts, the claimed outcome and the proxy's log as
         # `writers.report_log` reduced it (no client-chosen path or method).
@@ -246,6 +246,19 @@ def _writer_worker(args, scenario) -> int:
             print(f"kept {workdir}", file=sys.stderr)
         else:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _worker_failure(returncode: int, stderr: str) -> str:
+    """Kit-written text for a failed worker, never the client's: the client shares the
+    worker's stderr (it can write to /proc/<ppid>/fd/2). On EXIT_SETUP the worker's own last
+    `setup error: ` line, which `main` prints after the client's process group was killed, so
+    a line the client forged earlier is not the last; otherwise fixed text."""
+    if returncode == EXIT_SETUP:
+        lines = [ln for ln in stderr.splitlines() if ln.startswith("setup error: ")]
+        return lines[-1].removeprefix("setup error: ") if lines else "no detail"
+    if returncode < 0:
+        return f"killed by signal {-returncode}"
+    return "kit error, see stderr"
 
 
 def _run(args) -> int:
@@ -294,8 +307,7 @@ def _run(args) -> int:
         if proc.stderr.strip():
             sys.stderr.write(proc.stderr)
         if proc.returncode != EXIT_PASS:
-            tail = [ln for ln in proc.stderr.strip().splitlines() if not ln.startswith("kept ")]
-            detail = tail[-1].removeprefix("setup error: ") if tail else "no detail"
+            detail = _worker_failure(proc.returncode, proc.stderr)
             setup_error = f"{sid}: worker exited {proc.returncode}: {detail}"
             break
         result = json.loads(proc.stdout.strip().splitlines()[-1])

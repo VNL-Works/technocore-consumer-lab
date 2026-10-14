@@ -70,7 +70,7 @@ def parse_write_events(lines: list[str], write_id: str) -> tuple[dict | None, st
             continue
         try:
             ev = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested too deeply
             return None, f"line {n} is not JSON"
         if not isinstance(ev, dict):
             return None, f"line {n}: event is not a JSON object"
