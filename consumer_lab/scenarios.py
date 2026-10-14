@@ -14,6 +14,7 @@ import os
 import shlex
 import signal
 import subprocess
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -162,39 +163,80 @@ def client_env(contract: dict[str, str]) -> dict[str, str]:
     }
 
 
+# Catchable signals that end a process by default (SIGINT: by KeyboardInterrupt). A client can
+# send them to its worker; during a cycle they are recorded and re-delivered after the group kill.
+DEFERRED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)
+
+
 def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
     """Run one client cycle in its own session. Returns (exit code or None, timed out).
 
-    stdout is discarded and stderr appended to `stderr_path`. After every cycle, on timeout
-    and after a normal exit alike, the whole process group gets SIGKILL before this returns,
-    so a helper the client started in its group cannot keep running into the next step (a
-    process that left the group, e.g. via `setsid`, is not reached).
+    stdout is discarded and stderr appended to `stderr_path`. After every cycle the whole
+    process group gets SIGKILL before this returns: on timeout, after a normal exit, and also
+    when the wait raises, so a helper the client started in its group cannot keep running into
+    the next step (a process that left the group, e.g. via `setsid`, is not reached).
+
+    While the cycle runs, the catchable signals in `DEFERRED_SIGNALS` (which a client can send
+    to this process) are only recorded. After the group kill and the reap, the previous
+    handlers come back and each recorded signal is re-delivered once, in arrival order, so this
+    process then ends as it would have, but only after the client's group is dead. SIGKILL and
+    SIGSTOP cannot be caught or deferred: a worker killed by SIGKILL leaves the group alive.
+    Must run on the main thread (Python handlers are set and run there), else a SetupError.
     """
+    if threading.current_thread() is not threading.main_thread():
+        raise SetupError("run_client must run on the main thread: it defers the client's signals there")
+    arrived: list[int] = []
+    previous: dict[int, object] = {}
     try:
-        with open(stderr_path, "ab") as stderr:
-            proc = subprocess.Popen(
-                argv,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr,
-                start_new_session=True,
-            )
-    except OSError as exc:
-        raise SetupError(f"cannot start client {argv[0]!r}: {exc.strerror}") from exc
-    try:
-        exit_code, timed_out = proc.wait(timeout=timeout), False
-    except subprocess.TimeoutExpired:
-        exit_code, timed_out = None, True
-    finally:
-        # Also when the wait raised (a KeyboardInterrupt from a SIGINT that a process in the
-        # group sent to this worker, say): the group dies before the exception goes on.
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass  # the group is already empty (or its id now belongs to someone else)
-        proc.wait()
+            for sig in DEFERRED_SIGNALS:
+                # Minimal on purpose: runs on the main thread between bytecodes, at any point.
+                previous[sig] = signal.signal(sig, lambda signum, _frame: arrived.append(signum))
+        except ValueError as exc:  # signal.signal off the main thread
+            raise SetupError(f"cannot defer the client's signals: {exc}") from exc
+        try:
+            with open(stderr_path, "ab") as stderr:
+                proc = subprocess.Popen(
+                    argv,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+        except OSError as exc:
+            raise SetupError(f"cannot start client {argv[0]!r}: {exc.strerror}") from exc
+        try:
+            exit_code, timed_out = proc.wait(timeout=timeout), False
+        except subprocess.TimeoutExpired:
+            exit_code, timed_out = None, True
+        finally:
+            # Also when the wait raised: the group dies before the exception goes on.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass  # the group is already empty (or its id now belongs to someone else)
+            proc.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        _redeliver(arrived)
     return exit_code, timed_out
+
+
+def _redeliver(arrived: list[int]) -> None:
+    """Send each recorded signal once more to this process, in arrival order, now that the
+    client's group is dead and the previous handlers are back. A default-terminating one ends
+    the process here; an exception a handler raises (KeyboardInterrupt) goes on after the rest
+    were re-delivered."""
+    raised: BaseException | None = None
+    for sig in dict.fromkeys(arrived):
+        try:
+            os.kill(os.getpid(), sig)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            raised = raised or exc
+    if raised is not None:
+        raise raised
 
 
 class _FrozenTTL(float):

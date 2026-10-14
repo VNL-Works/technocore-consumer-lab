@@ -6,7 +6,9 @@
 - An in-group SIGINT to the worker does not stop the group kill; a worker killed outright
   still leaves, with `--keep-root`, a kept dir that says why (also needs the tree).
 - v0.2.4: with `--keep-root`, result.json is never written through a link the client planted
-  or into a workdir it swapped for a link.
+  or into a workdir it swapped for a link; the catchable signals a client sends its worker
+  are deferred until the group is killed (a SIGTERM, or a SIGINT that lands just before the
+  kill); `run_client` off the main thread is a setup error.
 """
 
 import contextlib
@@ -300,6 +302,95 @@ class KeptFilesNeverWrittenThroughLinks(unittest.TestCase):
         self.assertEqual(len(kept), 1, output)
         self.assertTrue(Path(kept[0]).is_symlink(), output)
         self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
+
+
+SIGTERM_CLIENT = r"""
+import os, signal, time
+# Starts an in-group helper that records its pid, SIGTERMs the worker (this client's parent)
+# while the worker waits for this cycle, then sleeps; the client exits after the signal was sent.
+worker = os.getppid()
+if os.fork() == 0:
+    with open(HELPER_PID, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(0.3)
+    os.kill(worker, signal.SIGTERM)
+    time.sleep(30)
+    os._exit(0)
+with open(CLIENT_PID, "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(2)
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class DeferredSignalFromTheGroup(unittest.TestCase):
+    w0_dirs = SignalledWorker.w0_dirs
+    run_kit = SignalledWorker.run_kit
+
+    def test_sigterm_from_the_group_is_deferred_until_the_group_is_killed(self):
+        code, report, output, tmp = self.run_kit(SIGTERM_CLIENT)
+        pids = [int((tmp / name).read_text()) for name in ("helper.pid", "client.pid")]
+        seen = {pid: alive(pid) for pid in pids}
+        for pid, was_alive in seen.items():
+            if was_alive:  # never leave it behind; never signal a pid already seen dead
+                self.addCleanup(kill_quietly, pid)
+        self.assertEqual(seen, {pid: False for pid in pids}, output)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -15: killed by signal 15", output)
+
+
+@unittest.skipUnless(hasattr(os, "killpg") and Path("/proc").is_dir(), "needs POSIX process groups and /proc")
+class RunClientDefersSignals(unittest.TestCase):
+    def test_sigint_just_before_the_group_kill_does_not_skip_it(self):
+        # Hits the window deterministically: the SIGINT is raised in this process after the
+        # wait returned, as the first thing the group kill does, before the real killpg.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        pidfile = tmp / "helper.pid"
+        argv = ["sh", "-c", f'sleep 30 & echo $! > "{pidfile}"; exit 0']
+        real_killpg = os.killpg
+        calls = []
+
+        def sigint_then_killpg(pgid, sig):
+            calls.append(sig)
+            os.kill(os.getpid(), signal.SIGINT)
+            real_killpg(pgid, sig)
+
+        before = signal.getsignal(signal.SIGINT)
+        with mock.patch.object(os, "killpg", side_effect=sigint_then_killpg):
+            with self.assertRaises(KeyboardInterrupt):  # re-delivered after the kill
+                run_client(argv, dict(os.environ), tmp / "client.stderr", 10.0)
+        self.assertEqual(calls, [signal.SIGKILL])
+        pid = int(pidfile.read_text().strip())
+        helper_alive = alive(pid)
+        if helper_alive:  # never leave the helper behind; never signal a pid already seen dead
+            self.addCleanup(kill_quietly, pid)
+        self.assertFalse(helper_alive, f"helper {pid} outlived the cycle")
+        self.assertIs(signal.getsignal(signal.SIGINT), before)  # the previous handler is back
+
+    def test_off_the_main_thread_is_a_setup_error(self):
+        from consumer_lab.server import SetupError
+
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        marker = tmp / "ran"
+        got: list[BaseException | tuple] = []
+
+        def target():
+            try:
+                got.append(run_client(["sh", "-c", f'touch "{marker}"'], dict(os.environ), tmp / "e", 10.0))
+            except BaseException as exc:  # noqa: BLE001 - inspected below
+                got.append(exc)
+
+        import threading
+
+        t = threading.Thread(target=target)
+        t.start()
+        t.join(30)
+        self.assertEqual(len(got), 1, got)
+        self.assertIsInstance(got[0], SetupError)
+        self.assertIn("main thread", str(got[0]))
+        self.assertFalse(marker.exists())  # no client was started
 
 
 if __name__ == "__main__":
