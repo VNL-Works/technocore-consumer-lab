@@ -3,6 +3,8 @@
 - `run_client` kills the client's process group after every cycle, not only on timeout.
 - A worker that times out leaves no temp dir behind (or, with `--keep-root`, a kept dir that
   says why). This one needs the upstream tree, like the lab tests, and is skipped without it.
+- An in-group SIGINT to the worker does not stop the group kill; a worker killed outright
+  still leaves, with `--keep-root`, a kept dir that says why (also needs the tree).
 """
 
 import contextlib
@@ -11,6 +13,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -118,6 +121,75 @@ class WorkerTimeoutLeavesNoStrayDir(unittest.TestCase):
             result,
             {"id": "W0", "exit_code": 2, "setup_error": f"W0: worker did not finish within {self.TIMEOUT}s"},
         )
+
+
+SIGINT_CLIENT = r'''
+import os, signal, time
+# Starts an in-group helper that records its pid, SIGINTs the worker (this client's parent)
+# while the worker waits for this cycle, then sleeps; the client sleeps too.
+worker = os.getppid()
+if os.fork() == 0:
+    with open(HELPER_PID, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(0.3)
+    os.kill(worker, signal.SIGINT)
+    time.sleep(30)
+    os._exit(0)
+with open(CLIENT_PID, "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(20)
+'''
+
+KILL_WORKER = r'''
+import os, signal
+# Kills its worker outright: the worker cannot write its own result.json.
+os.kill(os.getppid(), signal.SIGKILL)
+'''
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class SignalledWorker(unittest.TestCase):
+    def w0_dirs(self) -> set[str]:
+        return {p.name for p in Path(tempfile.gettempdir()).glob("consumer-lab-w0-*")}
+
+    def run_kit(self, source: str, *extra: str) -> tuple[int, dict | None, str, Path]:
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-sclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        script = tmp / "client.py"
+        script.write_text(f"HELPER_PID = {str(tmp / 'helper.pid')!r}\nCLIENT_PID = {str(tmp / 'client.pid')!r}\n" + source)
+        out = tmp / "report.json"
+        before = self.w0_dirs()
+        cmd = [sys.executable, "-m", "consumer_lab", "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", "W0", "--json", str(out), *extra]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=300)
+        for name in self.w0_dirs() - before:  # whatever this run left, the test removes
+            self.addCleanup(shutil.rmtree, Path(tempfile.gettempdir()) / name, True)
+        report = json.loads(out.read_text()) if out.exists() else None
+        output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        return proc.returncode, report, output, tmp
+
+    def test_sigint_from_the_group_still_kills_the_group(self):
+        code, report, output, tmp = self.run_kit(SIGINT_CLIENT)
+        pids = [int((tmp / name).read_text()) for name in ("helper.pid", "client.pid")]
+        seen = {pid: alive(pid) for pid in pids}
+        for pid, was_alive in seen.items():
+            if was_alive:  # never leave it behind; never signal a pid already seen dead
+                self.addCleanup(kill_quietly, pid)
+        self.assertEqual(seen, {pid: False for pid in pids}, output)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -2: killed by signal 2", output)
+
+    def test_keep_root_with_a_killed_worker_keeps_a_dir_that_says_why(self):
+        code, report, output, _ = self.run_kit(KILL_WORKER, "--keep-root")
+        setup_error = "W0: worker exited -9: killed by signal 9"
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], setup_error, output)
+        kept = [ln.removeprefix("kept ") for ln in output.splitlines() if ln.startswith("kept ")]
+        self.assertEqual(len(kept), 1, output)
+        kept_dir = Path(kept[0])
+        self.addCleanup(shutil.rmtree, kept_dir, True)
+        result = json.loads((kept_dir / "result.json").read_text())
+        self.assertEqual(result, {"id": "W0", "exit_code": 2, "setup_error": setup_error})
 
 
 if __name__ == "__main__":

@@ -186,11 +186,14 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
         exit_code, timed_out = proc.wait(timeout=timeout), False
     except subprocess.TimeoutExpired:
         exit_code, timed_out = None, True
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass  # the group is already empty (or its id now belongs to someone else)
-    proc.wait()
+    finally:
+        # Also when the wait raised (a KeyboardInterrupt from a SIGINT that a process in the
+        # group sent to this worker, say): the group dies before the exception goes on.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # the group is already empty (or its id now belongs to someone else)
+        proc.wait()
     return exit_code, timed_out
 
 
