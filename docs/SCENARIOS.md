@@ -187,19 +187,19 @@ upstream routes them: any `#fragment` dropped (as httptools does), then **percen
 upstream's `clean_text` keeps it unchanged, so `stored` counts what was posted.
 
 **Truth.** After the cycle the kit waits for the proxy to go idle (no handler in flight, no
-connection waiting in the listen backlog; at most 10 s), then counts the records in the room
+connection waiting in the listen backlog), then counts the records in the room
 whose `text` equals the write text, with `store.read_messages(root, room, limit=MAX_LIMIT)`
 in-process, never through the proxy. Upstream trims the text, so a copy posted with extra
 surrounding whitespace still counts; a retry that **alters** the text (a suffix, a counter) is a
 different message and is not counted as a second copy. The same read gives `other_records`:
 every non-seed record in the room whose text is not the write text (an altered retry, any other
 post); a read that returns `MAX_LIMIT` records or more is a setup error, as it may be cut off.
-The seed never counts and must still be there exactly once. After the proxy has stopped, the kit waits for it once more and requires
-that no request arrived after its snapshot of the log. After the cycle, and again after the
-proxy has stopped, the kit waits at most 10 s (`IDLE_TIMEOUT`) for the proxy to have no
-handler in flight and no connection in its backlog; if a connection to the proxy is still open
-then, for example from a process that escaped the group kill via `setsid`, the run is a setup
-error (exit 2), not a verdict. The proxy's log (method, path
+The seed never counts and must still be there exactly once. After the proxy has stopped, the
+kit waits for it to go idle once more and requires that no request arrived after its snapshot
+of the log. Each of the two idle waits lasts at most 10 s (`IDLE_TIMEOUT`); if a connection to
+the proxy is still open (not yet closed by the proxy) when a wait ends, for example from a
+process that escaped the group kill via `setsid`, the run is a setup error (exit 2), not a
+verdict. The proxy's log (method, path
 without query, action, forwarded, origin status; no bodies, no texts) is the truth about
 forwarding, and the kit asserts each scenario's
 precondition from it: in W1..W4 and W7 the first POST was forwarded and upstream answered 200
