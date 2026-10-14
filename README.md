@@ -113,13 +113,15 @@ differ). The JSON report has sorted keys, the upstream commit (or `"unknown"`), 
 its reason, and event counts; writer results add `outcome`, `stored`, `other_records` (other
 non-seed records the client posted) and the proxy's log, whose paths and methods appear only
 in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client
-whose processes all end with its cycle (the kit kills the client's process group), the report
-holds no record texts and no client strings from events, a client's integers appear in reasons
-only within 64-bit range (else as `a large integer`), and `setup_error` holds only kit-written
-text. The kit's own stderr may include whatever the worker and the client printed. The kit is
-not a sandbox: a client runs as the same user as the kit, and a process that leaves the client's
-group (via `setsid`, say) can still write the worker's output, and with it `setup_error` or a
-whole scenario result.
+whose processes all end with its cycle (the kit kills the client's process group after every
+cycle, also when an exception interrupts the worker's wait), the report holds no record texts
+and no client strings from events, a client's integers appear in reasons only within 64-bit
+range (else as `a large integer`), and `setup_error` holds only kit-written text. A worker
+result the kit cannot parse is a setup error (exit 2), not a crash. The kit's own stderr may
+include whatever the worker and the client printed. The kit is not a sandbox: a client runs as
+the same user as the kit; a process that leaves the client's group (via `setsid`, say), or a
+client whose worker was killed outright by a signal, can outlive the run, and the former can
+still write the worker's output, and with it `setup_error` or a whole scenario result.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
