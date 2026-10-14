@@ -34,6 +34,7 @@ from consumer_lab.server import (
 
 EXIT_PASS, EXIT_FAIL, EXIT_SETUP = 0, 1, 2
 WORKER_TIMEOUT = 600
+OUTPUT_TAIL_BYTES = 1 << 20  # how much of each worker stream the parent reads (the end of it)
 
 
 def _split_needs(needs: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -92,6 +93,35 @@ def _new_workdir(sid: str) -> Path:
 def _workdir(args, sid: str) -> Path:
     """The dir `_run` created for this scenario; a worker started by hand makes its own."""
     return Path(args.workdir) if args.workdir else _new_workdir(sid)
+
+
+def _write_kept_result(workdir: Path, outcome: dict) -> None:
+    """Write `outcome` to <workdir>/result.json for `--keep-root`, never through a link.
+
+    The client can create, rename and replace entries in its workdir (it knows the path from
+    TC_EVENTS), so: the workdir is opened without following a symlink, and result.json is
+    created relative to it, exclusively and without following one. If the workdir was replaced
+    or result.json already exists in any form, nothing is written, overwritten, followed or
+    deleted; a fixed kit line says so. (The workdir's parent, the system temp dir, is not
+    defended.)"""
+    text = json.dumps(outcome, sort_keys=True, indent=2) + "\n"
+    dir_fd = None
+    try:
+        dir_fd = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(
+            "result.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
+        )
+    except OSError:
+        print(f"not writing result.json in {workdir}: it was replaced or already exists", file=sys.stderr)
+        return
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass  # a full disk, say: the kept dir stays, without a complete result.json
 
 
 def _print_result(result: dict) -> None:
@@ -171,11 +201,7 @@ def _worker(args) -> int:
         if args.keep_root:
             if kit is not None:
                 outcome["cycle_exit_codes"] = [c.exit_code for c in kit.cycles]
-            try:
-                text = json.dumps(outcome, sort_keys=True, indent=2)
-                (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
-            except OSError:
-                pass
+            _write_kept_result(workdir, outcome)
             print(f"kept {workdir}", file=sys.stderr)
         else:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -246,11 +272,7 @@ def _writer_worker(args, scenario) -> int:
         if args.keep_root:
             if run is not None:
                 outcome["cycle_exit_codes"] = [run.cycle.exit_code]
-            try:
-                text = json.dumps(outcome, sort_keys=True, indent=2)
-                (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
-            except OSError:
-                pass
+            _write_kept_result(workdir, outcome)
             print(f"kept {workdir}", file=sys.stderr)
         else:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -292,13 +314,41 @@ def _worker_result(stdout: str) -> dict | None:
 
 def _keep_result_json(workdir: Path, sid: str, setup_error: str) -> None:
     """`--keep-root` for a worker that could not write its own result.json."""
-    result_json = {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error}
-    try:
-        text = json.dumps(result_json, sort_keys=True, indent=2)
-        (workdir / "result.json").write_text(text + "\n", encoding="utf-8")
-    except OSError:
-        pass
+    _write_kept_result(workdir, {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error})
     print(f"kept {workdir}", file=sys.stderr)
+
+
+def _tail(f) -> tuple[str, int]:
+    """The last OUTPUT_TAIL_BYTES of the open binary file `f`, decoded with replacement, and the
+    number of earlier bytes not read. The cut may land mid-line or mid-character."""
+    size = f.seek(0, os.SEEK_END)
+    start = max(0, size - OUTPUT_TAIL_BYTES)
+    f.seek(start)
+    return f.read(OUTPUT_TAIL_BYTES).decode("utf-8", errors="replace"), start
+
+
+def _run_worker(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str, int] | None:
+    """Run one worker; return (exit code, stdout tail, stderr tail, earlier stderr bytes not
+    read), or None when it did not finish within WORKER_TIMEOUT.
+
+    The client shares the worker's stdout and stderr (it can write to /proc/<ppid>/fd/1 and 2),
+    so either may hold anything, of any size. They go to two files in a temp dir of the
+    parent's, whose path the worker is never given, opened for append, so the worker's own
+    writes land at the end, after what the client wrote. The parent reads at most
+    OUTPUT_TAIL_BYTES of each, through its own descriptors, and removes the dir in every case."""
+    out_dir = tempfile.mkdtemp(prefix="consumer-lab-out-")
+    try:
+        with open(os.path.join(out_dir, "stdout"), "a+b") as out, \
+                open(os.path.join(out_dir, "stderr"), "a+b") as err:
+            try:
+                proc = subprocess.run(cmd, env=env, stdout=out, stderr=err, timeout=WORKER_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                return None
+            stdout, _ = _tail(out)
+            stderr, skipped = _tail(err)
+            return proc.returncode, stdout, stderr, skipped
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def _run(args) -> int:
@@ -327,28 +377,27 @@ def _run(args) -> int:
                "--client", args.client, "--scenario", sid, "--workdir", str(workdir)]
         if args.keep_root:
             cmd.append("--keep-root")
-        try:
-            # Bytes, decoded here with replacement: the client shares the worker's stdout and
-            # stderr, so either may hold anything, invalid UTF-8 included.
-            proc = subprocess.run(cmd, env=env, capture_output=True, timeout=WORKER_TIMEOUT)
-        except subprocess.TimeoutExpired:
+        ran = _run_worker(cmd, env)
+        if ran is None:
             setup_error = f"{sid}: worker did not finish within {WORKER_TIMEOUT}s"
             if args.keep_root:
                 _keep_result_json(workdir, sid, setup_error)
             else:
                 shutil.rmtree(workdir, ignore_errors=True)
             break
+        returncode, stdout, stderr, skipped = ran
         if not args.keep_root:
             shutil.rmtree(workdir, ignore_errors=True)  # the worker removes it; this is the backstop
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
+        if skipped:
+            sys.stderr.write(f"[worker stderr: {skipped} earlier bytes not shown]\n")
         if stderr.strip():
             sys.stderr.write(stderr)
-        if proc.returncode != EXIT_PASS:
-            detail = _worker_failure(proc.returncode, stderr)
-            setup_error = f"{sid}: worker exited {proc.returncode}: {detail}"
-            if args.keep_root and proc.returncode < 0 and not (workdir / "result.json").exists():
-                _keep_result_json(workdir, sid, setup_error)  # killed before it could write one
+        if returncode != EXIT_PASS:
+            detail = _worker_failure(returncode, stderr)
+            setup_error = f"{sid}: worker exited {returncode}: {detail}"
+            if args.keep_root and returncode < 0:
+                # Most likely killed before it wrote one; O_EXCL keeps one it did write.
+                _keep_result_json(workdir, sid, setup_error)
             break
         result = _worker_result(stdout)
         if result is None:

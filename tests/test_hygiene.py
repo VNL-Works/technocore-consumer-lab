@@ -5,6 +5,8 @@
   says why). This one needs the upstream tree, like the lab tests, and is skipped without it.
 - An in-group SIGINT to the worker does not stop the group kill; a worker killed outright
   still leaves, with `--keep-root`, a kept dir that says why (also needs the tree).
+- v0.2.4: with `--keep-root`, result.json is never written through a link the client planted
+  or into a workdir it swapped for a link.
 """
 
 import contextlib
@@ -190,6 +192,114 @@ class SignalledWorker(unittest.TestCase):
         self.addCleanup(shutil.rmtree, kept_dir, True)
         result = json.loads((kept_dir / "result.json").read_text())
         self.assertEqual(result, {"id": "W0", "exit_code": 2, "setup_error": setup_error})
+
+
+
+def remove_entry(path: Path) -> None:
+    """Remove what a run left at `path`: a link itself (never its target), or a dir tree."""
+    if path.is_symlink():
+        path.unlink()
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+NOT_WRITING = "not writing result.json in {}: it was replaced or already exists"
+
+# Set OUTSIDE before this source. Plants result.json in its workdir (known from TC_EVENTS) as a
+# link to OUTSIDE, which does not exist, then kills its worker outright: only the parent can
+# write result.json now.
+PLANT_LINK_THEN_KILL = r"""
+import os, signal
+os.symlink(OUTSIDE, os.path.join(os.path.dirname(os.environ["TC_EVENTS"]), "result.json"))
+os.kill(os.getppid(), signal.SIGKILL)
+"""
+
+# Set OUTSIDE before this source. Plants result.json as a link to OUTSIDE, an existing file, then
+# exits normally: the worker writes its own result.json in its finally.
+PLANT_LINK_THEN_EXIT = r"""
+import os
+os.symlink(OUTSIDE, os.path.join(os.path.dirname(os.environ["TC_EVENTS"]), "result.json"))
+"""
+
+# Set AWAY and OUTSIDE before this source. Renames its workdir to AWAY, puts a link to the dir
+# OUTSIDE in its place, then kills its worker outright.
+SWAP_WORKDIR_THEN_KILL = r"""
+import os, signal
+workdir = os.path.dirname(os.environ["TC_EVENTS"])
+os.rename(workdir, AWAY)
+os.symlink(OUTSIDE, workdir)
+os.kill(os.getppid(), signal.SIGKILL)
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class KeptFilesNeverWrittenThroughLinks(unittest.TestCase):
+    """--keep-root: result.json is created only as a new file in the real workdir (v0.2.4)."""
+
+    def w0_entries(self) -> set[str]:
+        return {p.name for p in Path(tempfile.gettempdir()).glob("consumer-lab-w0-*")}
+
+    def run_kit(self, tmp: Path, source: str) -> tuple[int, dict | None, str, list[str]]:
+        script = tmp / "client.py"
+        script.write_text(source)
+        out = tmp / "report.json"
+        before = self.w0_entries()
+        cmd = [sys.executable, "-m", "consumer_lab", "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", "W0", "--json", str(out),
+               "--keep-root"]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=300)
+        for name in self.w0_entries() - before:  # whatever this run left (a link, too), the test removes
+            self.addCleanup(remove_entry, Path(tempfile.gettempdir()) / name)
+        report = json.loads(out.read_text()) if out.exists() else None
+        output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        kept = [ln.removeprefix("kept ") for ln in output.splitlines() if ln.startswith("kept ")]
+        return proc.returncode, report, output, kept
+
+    def new_tmp(self) -> Path:
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-lclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return tmp
+
+    def test_parent_never_writes_through_a_planted_link(self):
+        tmp = self.new_tmp()
+        outside = tmp / "outside" / "target.json"
+        outside.parent.mkdir()
+        code, report, output, kept = self.run_kit(tmp, f"OUTSIDE = {str(outside)!r}\n" + PLANT_LINK_THEN_KILL)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -9: killed by signal 9", output)
+        self.assertEqual(len(kept), 1, output)
+        link = Path(kept[0]) / "result.json"
+        self.assertFalse(os.path.lexists(outside), output)  # nothing created through the link
+        self.assertTrue(link.is_symlink(), output)  # the planted link is left as it was
+        self.assertEqual(os.readlink(link), str(outside))
+        self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
+
+    def test_worker_never_overwrites_through_a_planted_link(self):
+        tmp = self.new_tmp()
+        outside = tmp / "outside.txt"
+        outside.write_text("ORIGINAL\n")
+        code, report, output, kept = self.run_kit(tmp, f"OUTSIDE = {str(outside)!r}\n" + PLANT_LINK_THEN_EXIT)
+        self.assertIsNotNone(report, output)
+        self.assertIsNone(report["setup_error"], output)
+        self.assertEqual(code, 1, output)  # W0 judged: this client posts nothing
+        self.assertEqual(outside.read_text(), "ORIGINAL\n", output)
+        self.assertEqual(len(kept), 1, output)
+        self.assertTrue((Path(kept[0]) / "result.json").is_symlink(), output)
+        self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
+
+    def test_parent_never_writes_into_a_swapped_workdir(self):
+        tmp = self.new_tmp()
+        outside = tmp / "outside"
+        outside.mkdir()
+        source = f"AWAY = {str(tmp / 'away')!r}\nOUTSIDE = {str(outside)!r}\n" + SWAP_WORKDIR_THEN_KILL
+        code, report, output, kept = self.run_kit(tmp, source)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -9: killed by signal 9", output)
+        self.assertEqual(list(outside.iterdir()), [], output)  # no result.json in the outside dir
+        self.assertFalse((tmp / "away" / "result.json").exists(), output)
+        self.assertEqual(len(kept), 1, output)
+        self.assertTrue(Path(kept[0]).is_symlink(), output)
+        self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
 
 
 if __name__ == "__main__":

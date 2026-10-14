@@ -228,13 +228,18 @@ class InvalidWorkerResult(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-wres-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         out = tmp / "report.json"
-        done = subprocess.CompletedProcess(["worker"], 0, stdout=stdout, stderr=b"")
+        def done(cmd, **kwargs):  # since v0.2.4 the worker's stdout is a file of the parent's
+            if hasattr(kwargs.get("stdout"), "write"):
+                kwargs["stdout"].write(stdout)
+                kwargs["stdout"].flush()
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr=b"")
+
         argv = ["run", "--upstream", str(tmp), "--client", "true", "--scenario", "S1", "--json", str(out)]
         err = io.StringIO()
         with mock.patch.object(cli, "marker_ok", return_value=(True, "")), \
                 mock.patch.object(cli, "missing_upstream_api", return_value=[]), \
                 mock.patch.object(cli, "upstream_commit", return_value="unknown"), \
-                mock.patch.object(cli.subprocess, "run", return_value=done), \
+                mock.patch.object(cli.subprocess, "run", side_effect=done), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             code = cli.main(argv)
         report = json.loads(out.read_text()) if out.exists() else None

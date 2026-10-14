@@ -545,6 +545,77 @@ class WriterKitV023(unittest.TestCase):
         self.check(1)
 
 
+FLOOD_MIB = 256
+# Peak RSS of the parent `run` process with the flood below (RUSAGE_SELF, children excluded).
+# Calibrated in the C3 round (v0.2.4): measured 35.4 MiB; the spec's ceiling is 256 MiB, and
+# v0.2.3, which held the whole output in memory, went far past it (see the round's red.log).
+PARENT_RSS_BOUND_MIB = 128
+
+# Set FLOOD_MIB and DONE before this source. Floods its worker's stdout with FLOOD_MIB MiB of
+# 64-byte lines, records how many bytes it wrote, then posts nothing and says so honestly.
+FLOOD_STDOUT = r"""
+import json, os
+fd = os.open(f"/proc/{os.getppid()}/fd/1", os.O_WRONLY)
+chunk = (b"consumer-lab flood " + b"x" * 44 + b"\n") * (1 << 14)  # 1 MiB of 64-byte lines
+written = 0
+for _ in range(FLOOD_MIB):
+    view = memoryview(chunk)
+    while view:
+        n = os.write(fd, view)
+        written += n
+        view = view[n:]
+os.close(fd)
+with open(DONE, "w") as f:
+    f.write(str(written))
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write(json.dumps({"event": "write", "id": os.environ["TC_WRITE_ID"], "outcome": "not_written"}) + "\n")
+"""
+
+# The parent `run`, with its own peak RSS (children excluded) as the last stderr line.
+MEASURED_RUN = r"""
+import resource, sys
+from consumer_lab import cli
+code = cli.main(sys.argv[1:])
+print(f"PARENT_MAXRSS_KIB {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}", file=sys.stderr)
+sys.exit(code)
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class WriterKitV024(unittest.TestCase):
+    """A client flooding its worker's stdout: the parent keeps at most 1 MiB of each stream."""
+
+    def test_flooded_stdout_keeps_the_parent_small(self):
+        # Writes FLOOD_MIB MiB to a file in the parent's temp dir: needs that much free in /tmp
+        # (about 1 s here; v0.2.3 took far longer and far more memory).
+        with tempfile.TemporaryDirectory(prefix="consumer-lab-wclient-") as tmp:
+            script, out, done = Path(tmp) / "client.py", Path(tmp) / "report.json", Path(tmp) / "done"
+            script.write_text(f"FLOOD_MIB = {FLOOD_MIB}\nDONE = {str(done)!r}\n" + FLOOD_STDOUT)
+            cmd = [sys.executable, "-B", "-c", MEASURED_RUN, "run", "--upstream", str(TREE),
+                   "--client", f"{sys.executable} {script}", "--scenario", "W0", "--json", str(out)]
+            started = time.monotonic()
+            proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=900)
+            took = time.monotonic() - started
+            report = json.loads(out.read_text()) if out.exists() else None
+            written = int(done.read_text()) if done.exists() else None
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        output = proc.stdout.decode("utf-8", errors="replace") + stderr
+        rss = [ln for ln in stderr.splitlines() if ln.startswith("PARENT_MAXRSS_KIB ")]
+        self.assertEqual(written, FLOOD_MIB << 20, output[-2000:])
+        self.assertTrue(rss, output[-2000:])
+        rss_mib = int(rss[-1].split()[1]) / 1024
+        print(f"\n[flood] {FLOOD_MIB} MiB on the worker's stdout: parent peak RSS {rss_mib:.1f} MiB "
+              f"(bound {PARENT_RSS_BOUND_MIB} MiB), exit {proc.returncode}, {took:.1f} s", file=sys.stderr)
+        self.assertIsNotNone(report, output[-2000:])
+        self.assertNotIn("Traceback", output)
+        if report["setup_error"] is None:  # the worker's own last line was read
+            self.assertEqual(verdicts(report), {"W0": "FAIL:missing_write"}, output[-2000:])
+            self.assertEqual(proc.returncode, 1, output[-2000:])
+        else:
+            self.assertEqual(report["setup_error"], "W0: worker printed no valid result")
+        self.assertLess(rss_mib, PARENT_RSS_BOUND_MIB, output[-2000:])
+
+
 class ReportLog(unittest.TestCase):
     """`writers.report_entry` on synthetic proxy log entries; no upstream needed."""
 
