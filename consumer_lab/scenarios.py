@@ -163,9 +163,26 @@ def client_env(contract: dict[str, str]) -> dict[str, str]:
     }
 
 
-# Catchable signals that end a process by default (SIGINT: by KeyboardInterrupt). A client can
-# send them to its worker; during a cycle they are recorded and re-delivered after the group kill.
-DEFERRED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)
+# The asynchronous, catchable signals that end a process by default (SIGINT: by
+# KeyboardInterrupt), by name where the platform has them, plus every real-time signal. A client
+# can send them to its worker; during a cycle they are recorded and re-delivered after the group
+# kill. Not here: SIGKILL and SIGSTOP (cannot be caught), and the fault signals SIGSEGV, SIGBUS,
+# SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS (a real fault under a recording handler could loop
+# or hide a crash); any of those can still end (or stop) the worker before the group kill.
+_DEFERRED_NAMES = (
+    "SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2",
+    "SIGALRM", "SIGVTALRM", "SIGPROF", "SIGXCPU", "SIGIO", "SIGPOLL", "SIGPWR", "SIGSTKFLT",
+)
+
+
+def _deferred_signals() -> tuple[int, ...]:
+    sigs = [int(getattr(signal, name)) for name in _DEFERRED_NAMES if hasattr(signal, name)]
+    if hasattr(signal, "SIGRTMIN") and hasattr(signal, "SIGRTMAX"):
+        sigs += range(int(signal.SIGRTMIN), int(signal.SIGRTMAX) + 1)
+    return tuple(dict.fromkeys(sigs))  # SIGIO and SIGPOLL can be one number
+
+
+DEFERRED_SIGNALS = _deferred_signals()
 
 
 def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
@@ -176,11 +193,13 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
     when the wait raises, so a helper the client started in its group cannot keep running into
     the next step (a process that left the group, e.g. via `setsid`, is not reached).
 
-    While the cycle runs, the catchable signals in `DEFERRED_SIGNALS` (which a client can send
-    to this process) are only recorded. After the group kill and the reap, the previous
-    handlers come back and each recorded signal is re-delivered once, in arrival order, so this
-    process then ends as it would have, but only after the client's group is dead. SIGKILL and
-    SIGSTOP cannot be caught or deferred: a worker killed by SIGKILL leaves the group alive.
+    While the cycle runs, the asynchronous terminating signals in `DEFERRED_SIGNALS` (which a
+    client can send to this process) are only recorded. After the group kill and the reap, the
+    previous handlers come back and each recorded signal is re-delivered once, in arrival order,
+    so this process then ends as it would have, but only after the client's group is dead. Not
+    deferred: SIGKILL and SIGSTOP, which cannot be caught, and the fault signals SIGSEGV, SIGBUS,
+    SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS; a client that sends one of those can still end
+    (or stop) this worker before the kill and leave its group alive.
     Must run on the main thread (Python handlers are set and run there), else a SetupError.
     """
     if threading.current_thread() is not threading.main_thread():

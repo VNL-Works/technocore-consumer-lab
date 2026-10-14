@@ -114,14 +114,14 @@ its reason, and event counts; writer results add `outcome`, `stored`, `other_rec
 non-seed records the client posted) and the proxy's log, whose paths and methods appear only
 in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client
 whose processes all end with its cycle (its group is killed after every cycle, even if the wait
-raises; signals to the worker other than SIGKILL and SIGSTOP act only after that kill), the
-report holds no record texts or client strings from events, client integers appear in reasons
-only within 64-bit range (else `a large integer`), and `setup_error` holds only kit text; an
-unparsable worker result is a setup error (exit 2). Only the last 1 MiB of each worker stream is
-read; the kit's stderr may show what worker and client printed. `--keep-root` never writes
-`result.json` through a link or over an existing entry. Not a sandbox: a client runs as the
-kit's user; a process that leaves its group (`setsid`) or a client whose worker got SIGKILL can
-outlive the run, and the former can still write the worker's output, `setup_error` and results.
+raises; asynchronous terminating signals to the worker act only after it), the report holds no
+record texts or client strings from events, client integers appear in reasons only within 64-bit
+range (else `a large integer`), and `setup_error` holds only kit text; a bad worker result is a
+setup error (exit 2). Only the last 1 MiB of each worker stream is read; kit stderr echoes what
+the worker printed. `--keep-root` never writes `result.json` through a link or over an existing
+entry. Not a sandbox: a client runs as the kit's user; a process leaving its group (`setsid`) can
+outlive the run and write the worker's output; SIGKILL, SIGSTOP and fault signals (SEGV, BUS,
+FPE, ILL, TRAP, ABRT, SYS) are not deferred and can end or stop the worker, leaving its client alive.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)

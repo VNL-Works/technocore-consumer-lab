@@ -6,9 +6,11 @@
 - An in-group SIGINT to the worker does not stop the group kill; a worker killed outright
   still leaves, with `--keep-root`, a kept dir that says why (also needs the tree).
 - v0.2.4: with `--keep-root`, result.json is never written through a link the client planted
-  or into a workdir it swapped for a link; the catchable signals a client sends its worker
-  are deferred until the group is killed (a SIGTERM, or a SIGINT that lands just before the
-  kill); `run_client` off the main thread is a setup error.
+  or into a workdir it swapped for a link, and the parent says when it did not write one
+  (silent only for the worker's own file after exit -2); the asynchronous terminating signals
+  a client sends its worker (SIGTERM, SIGALRM, a real-time signal, or a SIGINT that lands just
+  before the kill) are deferred until the group is killed; `run_client` off the main thread is
+  a setup error.
 """
 
 import contextlib
@@ -233,6 +235,30 @@ os.symlink(OUTSIDE, workdir)
 os.kill(os.getppid(), signal.SIGKILL)
 """
 
+# Plants result.json as a regular file of its own, then kills its worker outright.
+PLANT_FILE_THEN_KILL = r"""
+import os, signal
+with open(os.path.join(os.path.dirname(os.environ["TC_EVENTS"]), "result.json"), "w") as f:
+    f.write("PLANTED\n")
+os.kill(os.getppid(), signal.SIGKILL)
+"""
+
+# Set OUTSIDE and HELPER_PID before this source. Plants result.json as a hard link to OUTSIDE (a
+# regular file, two links), then an in-group helper SIGINTs the worker: exit -2.
+HARDLINK_THEN_SIGINT = r"""
+import os, signal, time
+os.link(OUTSIDE, os.path.join(os.path.dirname(os.environ["TC_EVENTS"]), "result.json"))
+worker = os.getppid()
+if os.fork() == 0:
+    with open(HELPER_PID, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(0.3)
+    os.kill(worker, signal.SIGINT)
+    time.sleep(30)
+    os._exit(0)
+time.sleep(2)
+"""
+
 
 @unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
 class KeptFilesNeverWrittenThroughLinks(unittest.TestCase):
@@ -303,6 +329,44 @@ class KeptFilesNeverWrittenThroughLinks(unittest.TestCase):
         self.assertTrue(Path(kept[0]).is_symlink(), output)
         self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
 
+    def test_parent_reports_a_planted_regular_file_after_a_kill(self):
+        # Not exit -2: the worker's own `finally` never ran, so the file is not its own and the
+        # parent says it did not write, then where the kept dir is.
+        tmp = self.new_tmp()
+        code, report, output, kept = self.run_kit(tmp, PLANT_FILE_THEN_KILL)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -9: killed by signal 9", output)
+        self.assertEqual(len(kept), 1, output)
+        self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
+        planted = Path(kept[0]) / "result.json"
+        self.assertFalse(planted.is_symlink())
+        self.assertEqual(planted.read_text(), "PLANTED\n")  # left as the client wrote it
+
+    def test_hardlinked_result_json_after_sigint_is_not_taken_as_the_workers(self):
+        tmp = self.new_tmp()
+        outside = tmp / "outside.txt"
+        outside.write_text("ORIGINAL\n")
+        helper_pid = tmp / "helper.pid"
+        source = f"OUTSIDE = {str(outside)!r}\nHELPER_PID = {str(helper_pid)!r}\n" + HARDLINK_THEN_SIGINT
+        code, report, output, kept = self.run_kit(tmp, source)
+        pid = int(helper_pid.read_text())
+        helper_alive = alive(pid)
+        if helper_alive:  # never leave it behind; never signal a pid already seen dead
+            self.addCleanup(kill_quietly, pid)
+        self.assertFalse(helper_alive, output)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], "W0: worker exited -2: killed by signal 2", output)
+        self.assertEqual(outside.read_text(), "ORIGINAL\n", output)  # never written through
+        self.assertEqual(outside.stat().st_nlink, 2, output)
+        # Exit -2 but two links: not the worker's own file, so the parent is not quiet. Its
+        # lines come last, before its setup error: `not writing`, then one `kept`. (The worker
+        # printed its own `not writing` and `kept` earlier.)
+        lines = output.splitlines()
+        at = lines.index("setup error: W0: worker exited -2: killed by signal 2")
+        self.assertEqual(len(set(kept)), 1, output)
+        self.assertEqual(lines[at - 2:at], [NOT_WRITING.format(kept[0]), f"kept {kept[0]}"], output)
+        self.assertEqual(len(kept), 2, output)  # one from the worker, one from the parent
+
 
 SIGTERM_CLIENT = r"""
 import os, signal, time
@@ -337,6 +401,24 @@ class DeferredSignalFromTheGroup(unittest.TestCase):
         self.assertEqual(seen, {pid: False for pid in pids}, output)
         self.assertEqual(code, 2, output)
         self.assertEqual(report["setup_error"], "W0: worker exited -15: killed by signal 15", output)
+
+    def check_deferred(self, expr: str, signum: int):
+        source = SIGTERM_CLIENT.replace("signal.SIGTERM", expr)
+        code, report, output, tmp = self.run_kit(source)
+        pids = [int((tmp / name).read_text()) for name in ("helper.pid", "client.pid")]
+        seen = {pid: alive(pid) for pid in pids}
+        for pid, was_alive in seen.items():
+            if was_alive:  # never leave it behind; never signal a pid already seen dead
+                self.addCleanup(kill_quietly, pid)
+        self.assertEqual(seen, {pid: False for pid in pids}, output)
+        self.assertEqual(code, 2, output)
+        self.assertEqual(report["setup_error"], f"W0: worker exited -{signum}: killed by signal {signum}", output)
+
+    def test_sigalrm_from_the_group_is_deferred_until_the_group_is_killed(self):
+        self.check_deferred("signal.SIGALRM", int(signal.SIGALRM))
+
+    def test_realtime_signal_from_the_group_is_deferred_until_the_group_is_killed(self):
+        self.check_deferred("signal.SIGRTMIN", int(signal.SIGRTMIN))
 
     def test_sigint_with_keep_root_keeps_the_workers_own_result_with_one_kept_line(self):
         # The worker writes its own result.json (KeyboardInterrupt); the parent's O_EXCL create

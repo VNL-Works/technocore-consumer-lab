@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -96,17 +97,18 @@ def _workdir(args, sid: str) -> Path:
     return Path(args.workdir) if args.workdir else _new_workdir(sid)
 
 
-def _write_kept_result(workdir: Path, outcome: dict, quiet_if_regular: bool = False) -> bool:
+def _write_kept_result(workdir: Path, outcome: dict, quiet_if_own: bool = False) -> bool:
     """Write `outcome` to <workdir>/result.json for `--keep-root`, never through a link.
 
     The client can create, rename and replace entries in its workdir (it knows the path from
     TC_EVENTS), so: the workdir is opened without following a symlink, and result.json is
     created relative to it, exclusively and without following one. If the workdir was replaced
     or result.json already exists in any form, nothing is written, overwritten, followed or
-    deleted, and a fixed kit line says so; except, with `quiet_if_regular` (the parent's call),
-    when result.json already exists as a regular file (the worker's own, or the client's):
-    then nothing is printed and False is returned. Otherwise True. (The workdir's parent, the
-    system temp dir, is not defended.)"""
+    deleted, and a fixed kit line says so; except, with `quiet_if_own` (the parent's call after
+    a worker exit of -2, the one signal exit where the worker's own `finally` ran and printed
+    `kept`), when result.json exists as a regular file with one link (taken as the worker's
+    own): then nothing is printed and False is returned. Otherwise True. (The workdir's parent,
+    the system temp dir, is not defended.)"""
     text = json.dumps(outcome, sort_keys=True, indent=2) + "\n"
     dir_fd = None
     try:
@@ -115,12 +117,12 @@ def _write_kept_result(workdir: Path, outcome: dict, quiet_if_regular: bool = Fa
             "result.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
         )
     except OSError:
-        if quiet_if_regular and dir_fd is not None:
+        if quiet_if_own and dir_fd is not None:
             try:
                 existing = os.lstat("result.json", dir_fd=dir_fd)  # never follows
             except OSError:
                 existing = None
-            if existing is not None and stat.S_ISREG(existing.st_mode):
+            if existing is not None and stat.S_ISREG(existing.st_mode) and existing.st_nlink == 1:
                 return False
         print(f"not writing result.json in {workdir}: it was replaced or already exists", file=sys.stderr)
         return True
@@ -323,12 +325,13 @@ def _worker_result(stdout: str) -> dict | None:
     return result
 
 
-def _keep_result_json(workdir: Path, sid: str, setup_error: str) -> None:
-    """`--keep-root` for a worker that could not write its own result.json. A regular
-    result.json already there (the worker's own, which then printed `kept` itself) is left as
-    it is, silently, with no second `kept` line."""
+def _keep_result_json(workdir: Path, sid: str, setup_error: str, worker_wrote_its_own: bool = False) -> None:
+    """`--keep-root` for a worker that could not write its own result.json. With
+    `worker_wrote_its_own` (exit -2: its `finally` ran and printed `kept`), a regular
+    single-link result.json already there is left as it is, silently, with no second `kept`
+    line; in every other case a refused write prints the `not writing` line and one `kept`."""
     outcome = {"id": sid, "exit_code": EXIT_SETUP, "setup_error": setup_error}
-    if _write_kept_result(workdir, outcome, quiet_if_regular=True):
+    if _write_kept_result(workdir, outcome, quiet_if_own=worker_wrote_its_own):
         print(f"kept {workdir}", file=sys.stderr)
 
 
@@ -411,7 +414,8 @@ def _run(args) -> int:
             setup_error = f"{sid}: worker exited {returncode}: {detail}"
             if args.keep_root and returncode < 0:
                 # Most likely killed before it wrote one; O_EXCL keeps one it did write.
-                _keep_result_json(workdir, sid, setup_error)
+                own = returncode == -signal.SIGINT  # its `finally` ran and printed `kept`
+                _keep_result_json(workdir, sid, setup_error, worker_wrote_its_own=own)
             break
         result = _worker_result(stdout)
         if result is None:
