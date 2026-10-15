@@ -17,8 +17,12 @@ what the kit observed on them, not what a scenario means (docs/SCENARIOS.md is w
 pin).
 
 RuntimeFilesUnchanged guards why #545 (a84a3ff) and the #545 x #800 merge tree (735d078) get
-no runs of their own: the files the kit runs (src/config.py, src/store.py, src/app.py, uv.lock,
-pyproject.toml) are byte-identical to the pin's and to #800's respectively. Those trees come
+no runs of their own: the code the kit runs is byte-identical to the pin's and to #800's
+respectively. consumer_lab/server.py imports config, store and app from <tree>/src, and app and
+store import the other src/ modules (didkey, limit, manifest), so the guard compares every
+src/*.py (the union of both trees' names, so an added or removed module fails too) plus uv.lock
+and pyproject.toml. Served text assets (src/*.md, humans.html, SKILL.md) are not compared: no
+kit client fetches them. Those trees come
 from CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
 CONSUMER_LAB_COMBO_UPSTREAM (default ~/consumer-lab-upstream-combo-735d078), made with
 `git archive` of the commit and of the merge's tree id.
@@ -42,8 +46,15 @@ VARIANTS = [Path(p).expanduser() for p in os.environ.get("CONSUMER_LAB_VARIANT_U
 PR545 = Path(os.environ.get("CONSUMER_LAB_PR545_UPSTREAM", "~/consumer-lab-upstream-pr545-a84a3ff")).expanduser()
 COMBO = Path(os.environ.get("CONSUMER_LAB_COMBO_UPSTREAM", "~/consumer-lab-upstream-combo-735d078")).expanduser()
 # What the kit runs from an upstream tree: consumer_lab/server.py imports config, store and app
-# from <tree>/src, under a venv built from uv.lock and pyproject.toml.
-RUNTIME_FILES = ["src/config.py", "src/store.py", "src/app.py", "uv.lock", "pyproject.toml"]
+# from <tree>/src, and app and store import the other src/ modules, so every src/*.py counts;
+# all of it runs under a venv built from uv.lock and pyproject.toml.
+LOCK_FILES = ["uv.lock", "pyproject.toml"]
+
+
+def runtime_files(*trees: Path) -> list[str]:
+    """Every src/*.py in any of the trees (sorted union), then LOCK_FILES."""
+    names = sorted({f"src/{f.name}" for t in trees for f in (t / "src").glob("*.py")})
+    return names + LOCK_FILES
 
 EMPTY_WINDOW = "empty window with last_seq"
 SCENARIOS = [f"S{n}" for n in range(1, 6)]
@@ -195,8 +206,10 @@ class RuntimeFilesUnchanged(unittest.TestCase):
             if not have_tree(tree):
                 self.skipTest(f"no upstream tree at {tree}: create it with `git archive` from a "
                               "technocore-chat clone (see the module docstring)")
-        for rel in RUNTIME_FILES:
+        for rel in runtime_files(base, other):
             with self.subTest(file=rel):
+                missing = [str(t) for t in (base, other) if not (t / rel).is_file()]
+                self.assertEqual(missing, [], f"{rel} is missing from {missing}")
                 self.assertEqual((base / rel).read_bytes(), (other / rel).read_bytes(),
                                  f"{rel} differs between {base} and {other}")
 
