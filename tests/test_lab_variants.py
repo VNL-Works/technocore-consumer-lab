@@ -20,9 +20,11 @@ RuntimeFilesUnchanged guards why #545 (a84a3ff) and the #545 x #800 merge tree (
 no runs of their own: the code the kit runs is byte-identical to the pin's and to #800's
 respectively. consumer_lab/server.py imports config, store and app from <tree>/src, and app and
 store import the other src/ modules (didkey, limit, manifest), so the guard compares every
-file at any depth under src/ (the union of both trees' paths, so an added or removed file
-fails too) plus uv.lock and pyproject.toml. It skips only __pycache__ and the served text files
-directly in src/ (a name ending in .md, or humans.html; see SERVED_TEXT_SUFFIXES and
+entry at any depth under src/ (the union of both trees' paths, so an added or removed entry
+fails too) plus uv.lock and pyproject.toml. Each entry's kind (file, directory or symlink,
+never following a symlink) must match; files must be byte-identical and symlinks must have
+the same target text. It skips only __pycache__ and the served text files directly in src/
+(a regular file whose name ends in .md, or humans.html; see SERVED_TEXT_SUFFIXES and
 SERVED_TEXT_NAMES), since no kit client fetches them. Those trees come
 from CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
 CONSUMER_LAB_COMBO_UPSTREAM (default ~/consumer-lab-upstream-combo-735d078), made with
@@ -33,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,31 +50,67 @@ VARIANTS = [Path(p).expanduser() for p in os.environ.get("CONSUMER_LAB_VARIANT_U
 PR545 = Path(os.environ.get("CONSUMER_LAB_PR545_UPSTREAM", "~/consumer-lab-upstream-pr545-a84a3ff")).expanduser()
 COMBO = Path(os.environ.get("CONSUMER_LAB_COMBO_UPSTREAM", "~/consumer-lab-upstream-combo-735d078")).expanduser()
 # What the kit runs from an upstream tree: consumer_lab/server.py imports config, store and app
-# from <tree>/src, and app and store import the other src/ modules, so every file under src/
-# counts (see runtime_files); all of it runs under a venv built from uv.lock and pyproject.toml.
+# from <tree>/src, and app and store import the other src/ modules, so every entry under src/
+# counts (see src_entries and compared_src_paths); all of it runs under a venv built from
+# uv.lock and pyproject.toml, which are compared as files.
 LOCK_FILES = ["uv.lock", "pyproject.toml"]
-# Served text files: excluded only when directly in src/ (deeper files with these names count).
+# Served text files: excluded only when a regular file directly in src/ (deeper files with
+# these names, and a symlink or directory with these names, count).
 SERVED_TEXT_SUFFIXES = (".md",)
 SERVED_TEXT_NAMES = ("humans.html",)
 
 
-def _is_compared(rel: Path) -> bool:
-    """rel is relative to <tree>/src."""
-    if "__pycache__" in rel.parts:
-        return False
-    if len(rel.parts) == 1 and (rel.name.endswith(SERVED_TEXT_SUFFIXES) or rel.name in SERVED_TEXT_NAMES):
-        return False
-    return True
+def _kind(path: Path) -> str:
+    """The kind of path itself, by lstat: a symlink is "symlink" whatever it points at."""
+    mode = os.lstat(path).st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "other"
+
+
+def _raise(exc: OSError):
+    raise exc
+
+
+def src_entries(tree: Path) -> dict[str, str]:
+    """{"src/<POSIX path>": kind} for every entry at any depth under <tree>/src, walked
+    without following symlinks (a symlinked directory is one "symlink" entry, not descended;
+    a dangling symlink is listed too). __pycache__ directories are not descended. A walk
+    error raises instead of hiding part of the tree."""
+    root = tree / "src"
+    entries = {}
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise, followlinks=False):
+        for name in dirnames + filenames:
+            path = Path(dirpath, name)
+            entries[f"src/{path.relative_to(root).as_posix()}"] = _kind(path)
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+    return entries
+
+
+def _is_excluded(rel: str, kind: str) -> bool:
+    """rel is "src/..."; kind is its kind in one tree."""
+    parts = rel.split("/")[1:]
+    if "__pycache__" in parts:
+        return True
+    name = parts[-1]
+    return (kind == "file" and len(parts) == 1
+            and (name.endswith(SERVED_TEXT_SUFFIXES) or name in SERVED_TEXT_NAMES))
+
+
+def compared_src_paths(*entries: dict[str, str]) -> list[str]:
+    """The sorted union of the src_entries paths, dropping a path only when, in every tree
+    where it exists, it is excluded (so a served file replaced by a symlink is compared)."""
+    return sorted({rel for e in entries for rel in e
+                   if not all(_is_excluded(rel, x[rel]) for x in entries if rel in x)})
 
 
 def runtime_files(*trees: Path) -> list[str]:
-    """Every regular file at any depth under src/ in any of the trees (sorted union of
-    POSIX paths), except __pycache__ and the served text files directly in src/; then
-    LOCK_FILES."""
-    names = sorted({f"src/{f.relative_to(t / 'src').as_posix()}"
-                    for t in trees for f in (t / "src").rglob("*")
-                    if f.is_file() and _is_compared(f.relative_to(t / "src"))})
-    return names + LOCK_FILES
+    """The compared src/ paths across the trees, then LOCK_FILES."""
+    return compared_src_paths(*(src_entries(t) for t in trees)) + LOCK_FILES
 
 EMPTY_WINDOW = "empty window with last_seq"
 SCENARIOS = [f"S{n}" for n in range(1, 6)]
@@ -215,19 +254,39 @@ class PinnedTreeContrast(unittest.TestCase):
 
 class RuntimeFilesUnchanged(unittest.TestCase):
     """The docs say #545 and the #545 x #800 merge need no kit runs of their own, because they
-    change no file the kit runs. Every file under src/ is compared (see runtime_files), so a
-    later head that changes, adds or removes one (a module, a package directory, a
-    src/pyproject.toml, a compiled extension) fails this instead of the docs quietly going
-    stale."""
+    change no file the kit runs. Every entry under src/ is compared by kind (see src_entries
+    and compared_src_paths), never following a symlink: files by bytes, symlinks by target
+    text, directories by presence. So a later head that changes, adds or removes one (a
+    module, a package directory, an empty directory, a src/pyproject.toml, a compiled
+    extension, a symlink that could shadow an installed library, a dangling symlink) fails
+    this instead of the docs quietly going stale."""
 
     def _same_runtime_files(self, base: Path, other: Path):
         for tree in (base, other):
             if not have_tree(tree):
                 self.skipTest(f"no upstream tree at {tree}: create it with `git archive` from a "
                               "technocore-chat clone (see the module docstring)")
-        for rel in runtime_files(base, other):
+        trees = (base, other)
+        # Walked once per tree; presence below is lstat-based (a dangling symlink is present).
+        entries = [src_entries(t) for t in trees]
+        for rel in compared_src_paths(*entries):
+            with self.subTest(entry=rel):
+                kinds = [e.get(rel) for e in entries]
+                missing = [str(t) for t, k in zip(trees, kinds) if k is None]
+                self.assertEqual(missing, [], f"{rel} is missing from {missing}")
+                odd = [str(t / rel) for t, k in zip(trees, kinds) if k == "other"]
+                self.assertEqual(odd, [], f"{rel} is not a file, directory or symlink in {odd}")
+                self.assertEqual(kinds[0], kinds[1], f"{rel} is a {kinds[0]} in {base} but a "
+                                 f"{kinds[1]} in {other}")
+                if kinds[0] == "file":
+                    self.assertEqual((base / rel).read_bytes(), (other / rel).read_bytes(),
+                                     f"{rel} differs between {base} and {other}")
+                elif kinds[0] == "symlink":
+                    self.assertEqual(os.readlink(base / rel), os.readlink(other / rel),
+                                     f"{rel} points elsewhere in {other} than in {base}")
+        for rel in LOCK_FILES:
             with self.subTest(file=rel):
-                missing = [str(t) for t in (base, other) if not (t / rel).is_file()]
+                missing = [str(t) for t in trees if not (t / rel).is_file()]
                 self.assertEqual(missing, [], f"{rel} is missing from {missing}")
                 self.assertEqual((base / rel).read_bytes(), (other / rel).read_bytes(),
                                  f"{rel} differs between {base} and {other}")
