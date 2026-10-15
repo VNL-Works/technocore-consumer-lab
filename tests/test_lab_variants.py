@@ -2,18 +2,26 @@
 
 At the pinned commit an empty window reports `last_seq = min(since, head)`, so the careful
 client's "empty page whose last_seq is above the cursor" branch can never run there. PRs #800
-(head 6ce0852) and #910 (head b72607e) make an empty window report the room head instead, so
+(head 01cecdc) and #910 (head b72607e) make an empty window report the room head instead, so
 with every later `e-` record expired the page carries `last_seq > since`. These tests run both
 reference clients against those trees and prove that the branch ran, and that it cannot run at
-the pin.
+the pin. #800's earlier head 6ce0852 gave the same results, and CONSUMER_LAB_VARIANT_UPSTREAMS
+can still point at that tree.
 
 Trees come from CONSUMER_LAB_VARIANT_UPSTREAMS (os.pathsep-separated); the default is
-~/consumer-lab-upstream-pr800-6ce0852 and ~/consumer-lab-upstream-pr910-b72607e, made with
+~/consumer-lab-upstream-pr800-01cecdc and ~/consumer-lab-upstream-pr910-b72607e, made with
 `git archive <sha>` from a technocore-chat clone (no `.consumer-lab-upstream` marker, so the
 report says "unknown"). An absent tree is skipped, loudly, per tree. The pinned tree is
 CONSUMER_LAB_UPSTREAM, as in test_lab.py. These trees are not the pin: a verdict here says
 what the kit observed on them, not what a scenario means (docs/SCENARIOS.md is written for the
 pin).
+
+RuntimeFilesUnchanged guards why #545 (a84a3ff) and the #545 x #800 merge tree (735d078) get
+no runs of their own: the files the kit runs (src/config.py, src/store.py, src/app.py, uv.lock,
+pyproject.toml) are byte-identical to the pin's and to #800's respectively. Those trees come
+from CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
+CONSUMER_LAB_COMBO_UPSTREAM (default ~/consumer-lab-upstream-combo-735d078), made with
+`git archive` of the commit and of the merge's tree id.
 """
 
 import json
@@ -28,8 +36,14 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 PINNED = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
-DEFAULT_VARIANTS = os.pathsep.join(["~/consumer-lab-upstream-pr800-6ce0852", "~/consumer-lab-upstream-pr910-b72607e"])
+PR800 = Path("~/consumer-lab-upstream-pr800-01cecdc").expanduser()
+DEFAULT_VARIANTS = os.pathsep.join([str(PR800), "~/consumer-lab-upstream-pr910-b72607e"])
 VARIANTS = [Path(p).expanduser() for p in os.environ.get("CONSUMER_LAB_VARIANT_UPSTREAMS", DEFAULT_VARIANTS).split(os.pathsep) if p]
+PR545 = Path(os.environ.get("CONSUMER_LAB_PR545_UPSTREAM", "~/consumer-lab-upstream-pr545-a84a3ff")).expanduser()
+COMBO = Path(os.environ.get("CONSUMER_LAB_COMBO_UPSTREAM", "~/consumer-lab-upstream-combo-735d078")).expanduser()
+# What the kit runs from an upstream tree: consumer_lab/server.py imports config, store and app
+# from <tree>/src, under a venv built from uv.lock and pyproject.toml.
+RUNTIME_FILES = ["src/config.py", "src/store.py", "src/app.py", "uv.lock", "pyproject.toml"]
 
 EMPTY_WINDOW = "empty window with last_seq"
 SCENARIOS = [f"S{n}" for n in range(1, 6)]
@@ -169,6 +183,28 @@ class PinnedTreeContrast(unittest.TestCase):
         for sid in SCENARIOS:
             self.assertTrue(events[sid], f"{sid}: events.jsonl missing or empty\n{output}")
         self.assertEqual({sid: losses for sid, losses in empty_window_losses(events).items() if losses}, {}, output)
+
+
+class RuntimeFilesUnchanged(unittest.TestCase):
+    """The docs say #545 and the #545 x #800 merge need no kit runs of their own, because they
+    change no file the kit runs. If a later head changes one, this fails instead of the docs
+    quietly going stale."""
+
+    def _same_runtime_files(self, base: Path, other: Path):
+        for tree in (base, other):
+            if not have_tree(tree):
+                self.skipTest(f"no upstream tree at {tree}: create it with `git archive` from a "
+                              "technocore-chat clone (see the module docstring)")
+        for rel in RUNTIME_FILES:
+            with self.subTest(file=rel):
+                self.assertEqual((base / rel).read_bytes(), (other / rel).read_bytes(),
+                                 f"{rel} differs between {base} and {other}")
+
+    def test_pr545_runs_the_pins_code(self):
+        self._same_runtime_files(PINNED, PR545)
+
+    def test_combo_runs_pr800s_code(self):
+        self._same_runtime_files(PR800, COMBO)
 
 
 if __name__ == "__main__":

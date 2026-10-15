@@ -58,13 +58,16 @@ what `docs/SCENARIOS.md` says. The kit refuses to start (exit 2) when `src/store
 It does not vendor upstream: it runs an upstream tree you point it at.
 
 **Other upstream trees.** The kit was also run against two open upstream PRs, #800 (head
-`6ce0852`) and #910 (head `b72607e`), which make an empty window report the room head as
-`last_seq`. Observed on both: the careful client PASS on S1..S5, the naive client the same five
-FAILs as in the table above. The careful client's empty-window branch (an empty page with
-`last_seq` above the cursor), which cannot run at the pin, fired in S3 only, in its middle cycle.
-These runs report `upstream_commit: "unknown"` (the trees carry no marker), and the pin still
-governs what a scenario means. `tests/test_lab_variants.py` repeats them
-(`CONSUMER_LAB_VARIANT_UPSTREAMS`, `os.pathsep`-separated; an absent tree is skipped).
+`01cecdc`; its earlier head `6ce0852` gave the same results) and #910 (head `b72607e`), which
+make an empty window report the room head as `last_seq`. Observed on both: the careful client
+PASS on S1..S5, the naive client the same five FAILs as in the table above. The careful client's
+empty-window branch (an empty page with `last_seq` above the cursor), which cannot run at the
+pin, fired in S3 only, in its middle cycle. These runs report `upstream_commit: "unknown"` (the
+trees carry no marker), and the pin still governs what a scenario means.
+`tests/test_lab_variants.py` repeats them (`CONSUMER_LAB_VARIANT_UPSTREAMS`,
+`os.pathsep`-separated; an absent tree is skipped). #545 (`a84a3ff`) changes `src/interop.md`
+and tests only, so the kit runs the pin's code on it, and the #545 x #800 merge runs #800's
+code; the same file checks both (`RuntimeFilesUnchanged`), so neither needs a run of its own.
 
 ## S3 and S4 are a policy choice
 
