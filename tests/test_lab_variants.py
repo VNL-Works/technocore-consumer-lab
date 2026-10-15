@@ -20,9 +20,10 @@ RuntimeFilesUnchanged guards why #545 (a84a3ff) and the #545 x #800 merge tree (
 no runs of their own: the code the kit runs is byte-identical to the pin's and to #800's
 respectively. consumer_lab/server.py imports config, store and app from <tree>/src, and app and
 store import the other src/ modules (didkey, limit, manifest), so the guard compares every
-src/*.py (the union of both trees' names, so an added or removed module fails too) plus uv.lock
-and pyproject.toml. Served text assets (src/*.md, humans.html, SKILL.md) are not compared: no
-kit client fetches them. Those trees come
+file at any depth under src/ (the union of both trees' paths, so an added or removed file
+fails too) plus uv.lock and pyproject.toml. It skips only __pycache__ and the served text files
+directly in src/ (a name ending in .md, or humans.html; see SERVED_TEXT_SUFFIXES and
+SERVED_TEXT_NAMES), since no kit client fetches them. Those trees come
 from CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
 CONSUMER_LAB_COMBO_UPSTREAM (default ~/consumer-lab-upstream-combo-735d078), made with
 `git archive` of the commit and of the merge's tree id.
@@ -46,14 +47,30 @@ VARIANTS = [Path(p).expanduser() for p in os.environ.get("CONSUMER_LAB_VARIANT_U
 PR545 = Path(os.environ.get("CONSUMER_LAB_PR545_UPSTREAM", "~/consumer-lab-upstream-pr545-a84a3ff")).expanduser()
 COMBO = Path(os.environ.get("CONSUMER_LAB_COMBO_UPSTREAM", "~/consumer-lab-upstream-combo-735d078")).expanduser()
 # What the kit runs from an upstream tree: consumer_lab/server.py imports config, store and app
-# from <tree>/src, and app and store import the other src/ modules, so every src/*.py counts;
-# all of it runs under a venv built from uv.lock and pyproject.toml.
+# from <tree>/src, and app and store import the other src/ modules, so every file under src/
+# counts (see runtime_files); all of it runs under a venv built from uv.lock and pyproject.toml.
 LOCK_FILES = ["uv.lock", "pyproject.toml"]
+# Served text files: excluded only when directly in src/ (deeper files with these names count).
+SERVED_TEXT_SUFFIXES = (".md",)
+SERVED_TEXT_NAMES = ("humans.html",)
+
+
+def _is_compared(rel: Path) -> bool:
+    """rel is relative to <tree>/src."""
+    if "__pycache__" in rel.parts:
+        return False
+    if len(rel.parts) == 1 and (rel.name.endswith(SERVED_TEXT_SUFFIXES) or rel.name in SERVED_TEXT_NAMES):
+        return False
+    return True
 
 
 def runtime_files(*trees: Path) -> list[str]:
-    """Every src/*.py in any of the trees (sorted union), then LOCK_FILES."""
-    names = sorted({f"src/{f.name}" for t in trees for f in (t / "src").glob("*.py")})
+    """Every regular file at any depth under src/ in any of the trees (sorted union of
+    POSIX paths), except __pycache__ and the served text files directly in src/; then
+    LOCK_FILES."""
+    names = sorted({f"src/{f.relative_to(t / 'src').as_posix()}"
+                    for t in trees for f in (t / "src").rglob("*")
+                    if f.is_file() and _is_compared(f.relative_to(t / "src"))})
     return names + LOCK_FILES
 
 EMPTY_WINDOW = "empty window with last_seq"
@@ -198,8 +215,10 @@ class PinnedTreeContrast(unittest.TestCase):
 
 class RuntimeFilesUnchanged(unittest.TestCase):
     """The docs say #545 and the #545 x #800 merge need no kit runs of their own, because they
-    change no file the kit runs. If a later head changes one, this fails instead of the docs
-    quietly going stale."""
+    change no file the kit runs. Every file under src/ is compared (see runtime_files), so a
+    later head that changes, adds or removes one (a module, a package directory, a
+    src/pyproject.toml, a compiled extension) fails this instead of the docs quietly going
+    stale."""
 
     def _same_runtime_files(self, base: Path, other: Path):
         for tree in (base, other):
