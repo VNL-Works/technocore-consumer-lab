@@ -82,7 +82,7 @@ and one `TC_EVENTS` file.
   loop would checkpoint 6 and never notice: that is the composition bug found on 2026-10-13
   (PR #545 comment 6136144371). The careful client checks "empty page with `last_seq > since`"
   for that case too.
-- **On the #800/#910 trees** (open PRs, heads `01cecdc` and `b72607e`; not the pin). These
+- **On the #800/#910 trees** (open PRs, heads `f686ceb` and `b72607e`; not the pin). These
   trees make an empty window report the room head, so the middle cycle's read is
   `messages = []` with `last_seq = 6` above the cursor 3. Observed on both: the careful client
   takes its empty-window branch there, writes `loss after_seq=3` ("empty window with last_seq 6

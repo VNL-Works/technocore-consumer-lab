@@ -58,7 +58,7 @@ what `docs/SCENARIOS.md` says. The kit refuses to start (exit 2) when `src/store
 It does not vendor upstream: it runs an upstream tree you point it at.
 
 **Other upstream trees.** The kit was also run against two open upstream PRs, #800 (head
-`01cecdc`; its earlier head `6ce0852` gave the same results) and #910 (head `b72607e`), which
+`f686ceb`; its earlier heads `6ce0852` and `01cecdc` gave the same results) and #910 (head `b72607e`), which
 make an empty window report the room head as `last_seq`. Observed on both: the careful client
 PASS on S1..S5, the naive client the same five FAILs as in the table above. The careful client's
 empty-window branch (an empty page with `last_seq` above the cursor), which cannot run at the
