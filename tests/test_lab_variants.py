@@ -21,15 +21,21 @@ no runs of their own: the code the kit runs is byte-identical to the pin's and t
 respectively. consumer_lab/server.py imports config, store and app from <tree>/src, and app and
 store import the other src/ modules (didkey, limit, manifest), so the guard compares every
 entry at any depth under src/ (the union of both trees' paths, so an added or removed entry
-fails too) plus uv.lock and pyproject.toml. <tree>/src itself must be a real directory (by
-lstat; a symlinked src fails, since os.walk would follow it). Each entry's kind (file,
-directory or symlink, never following a symlink) must match; files must be byte-identical
-and symlinks must have the same target text. __pycache__ entries are compared like any other
-(CPython can load a matching .pyc instead of the source, and -B stops writing pycs, not
-reading them), so they must be absent from both trees or identical. The only exclusion is the
-served text files directly in src/ (a regular file whose name ends in .md, or humans.html;
-see SERVED_TEXT_SUFFIXES and SERVED_TEXT_NAMES), since no kit client fetches them. Those trees come
-from CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
+fails too) plus uv.lock and pyproject.toml. If <tree>/src exists by lstat it must be a real
+directory, or the test fails (a symlinked src, even a dangling one or one to a directory
+without store.py, fails, since os.walk would follow it). A tree is skipped when its src is
+absent, or when src is a real directory without a regular src/store.py (have_tree uses
+is_file, which follows symlinks, so a dangling src/store.py symlink skips too).
+Each entry's kind (file, directory or symlink, never following a symlink) must match; files
+must be byte-identical, and symlinks must have the same target text and must resolve
+(os.path.realpath) inside that tree's own src (a dangling target inside src is allowed).
+uv.lock and pyproject.toml must be regular files by lstat (not symlinks) and byte-identical.
+__pycache__ entries are compared like any other (CPython can load a matching .pyc instead
+of the source, and -B stops writing pycs, not reading them), so they must be absent from
+both trees or identical. The only exclusion is the served text files directly in src/ (a
+regular file whose name ends in .md, or humans.html; see SERVED_TEXT_SUFFIXES and
+SERVED_TEXT_NAMES), since no kit client fetches them. Those trees come from
+CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
 CONSUMER_LAB_COMBO_UPSTREAM (default ~/consumer-lab-upstream-combo-6cd4eb9), made with
 `git archive` of the commit and of the merge's tree id.
 """
@@ -55,7 +61,7 @@ COMBO = Path(os.environ.get("CONSUMER_LAB_COMBO_UPSTREAM", "~/consumer-lab-upstr
 # What the kit runs from an upstream tree: consumer_lab/server.py imports config, store and app
 # from <tree>/src, and app and store import the other src/ modules, so every entry under src/
 # counts (see src_entries and compared_src_paths); all of it runs under a venv built from
-# uv.lock and pyproject.toml, which are compared as files.
+# uv.lock and pyproject.toml, which must be regular files (by lstat) with the same bytes.
 LOCK_FILES = ["uv.lock", "pyproject.toml"]
 # Served text files: excluded only when a regular file directly in src/ (deeper files with
 # these names, and a symlink or directory with these names, count).
@@ -108,10 +114,6 @@ def compared_src_paths(*entries: dict[str, str]) -> list[str]:
     return sorted({rel for e in entries for rel in e
                    if not all(_is_excluded(rel, x[rel]) for x in entries if rel in x)})
 
-
-def runtime_files(*trees: Path) -> list[str]:
-    """The compared src/ paths across the trees, then LOCK_FILES."""
-    return compared_src_paths(*(src_entries(t) for t in trees)) + LOCK_FILES
 
 EMPTY_WINDOW = "empty window with last_seq"
 SCENARIOS = [f"S{n}" for n in range(1, 6)]
@@ -257,22 +259,30 @@ class RuntimeFilesUnchanged(unittest.TestCase):
     """The docs say #545 and the #545 x #800 merge need no kit runs of their own, because they
     change no file the kit runs. Every entry under src/ is compared by kind (see src_entries
     and compared_src_paths), never following a symlink: files by bytes, symlinks by target
-    text, directories by presence. So a later head that changes, adds or removes one (a
-    module, a package directory, an empty directory, a src/pyproject.toml, a compiled
-    extension, a symlink that could shadow an installed library, a dangling symlink, a
-    __pycache__ directory or .pyc) fails this instead of the docs quietly going stale.
-    <tree>/src itself must be a real directory by lstat (a symlinked src fails). The only
-    entries skipped are the served text files directly in src/."""
+    text and by where they resolve, directories by presence. So a later head that changes,
+    adds or removes one (a module, a package directory, an empty directory, a
+    src/pyproject.toml, a compiled extension, a symlink that could shadow an installed
+    library, a dangling symlink, a __pycache__ directory or .pyc) fails this instead of the
+    docs quietly going stale. If <tree>/src exists by lstat it must be a real directory (a
+    symlinked src fails, dangling or not). A tree is skipped when its src is absent, or when
+    src is a real directory without a regular src/store.py (have_tree, by is_file). A symlink
+    under src must resolve inside that tree's own src (a link to content outside src fails,
+    even with the same target text in both trees). uv.lock and pyproject.toml must be regular
+    files, then byte-identical. The only entries skipped are the served text files directly in
+    src/."""
 
     def _same_runtime_files(self, base: Path, other: Path):
-        for tree in (base, other):
+        trees = (base, other)
+        # Before the skip: have_tree follows symlinks, so a dangling or empty symlinked src
+        # would otherwise skip instead of failing.
+        for tree in trees:
+            if os.path.lexists(tree / "src"):
+                kind = _kind(tree / "src")
+                self.assertEqual(kind, "dir", f"{tree / 'src'} is a {kind}, not a directory")
+        for tree in trees:
             if not have_tree(tree):
                 self.skipTest(f"no upstream tree at {tree}: create it with `git archive` from a "
                               "technocore-chat clone (see the module docstring)")
-        trees = (base, other)
-        for tree in trees:
-            kind = _kind(tree / "src")
-            self.assertEqual(kind, "dir", f"{tree / 'src'} is a {kind}, not a directory")
         # Walked once per tree; presence below is lstat-based (a dangling symlink is present).
         entries = [src_entries(t) for t in trees]
         for rel in compared_src_paths(*entries):
@@ -288,12 +298,20 @@ class RuntimeFilesUnchanged(unittest.TestCase):
                     self.assertEqual((base / rel).read_bytes(), (other / rel).read_bytes(),
                                      f"{rel} differs between {base} and {other}")
                 elif kinds[0] == "symlink":
+                    for t in trees:
+                        root = os.path.realpath(t / "src")
+                        target = os.path.realpath(t / rel)
+                        self.assertEqual(os.path.commonpath([root, target]), root,
+                                         f"{rel} in {t} resolves to {target}, outside {root}")
                     self.assertEqual(os.readlink(base / rel), os.readlink(other / rel),
                                      f"{rel} points elsewhere in {other} than in {base}")
         for rel in LOCK_FILES:
             with self.subTest(file=rel):
-                missing = [str(t) for t in trees if not (t / rel).is_file()]
+                kinds = [_kind(t / rel) if os.path.lexists(t / rel) else None for t in trees]
+                missing = [str(t) for t, k in zip(trees, kinds) if k is None]
                 self.assertEqual(missing, [], f"{rel} is missing from {missing}")
+                odd = [f"{t / rel} is a {k}" for t, k in zip(trees, kinds) if k != "file"]
+                self.assertEqual(odd, [], f"{rel} is not a regular file: {odd}")
                 self.assertEqual((base / rel).read_bytes(), (other / rel).read_bytes(),
                                  f"{rel} differs between {base} and {other}")
 
