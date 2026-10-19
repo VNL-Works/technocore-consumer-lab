@@ -21,11 +21,14 @@ no runs of their own: the code the kit runs is byte-identical to the pin's and t
 respectively. consumer_lab/server.py imports config, store and app from <tree>/src, and app and
 store import the other src/ modules (didkey, limit, manifest), so the guard compares every
 entry at any depth under src/ (the union of both trees' paths, so an added or removed entry
-fails too) plus uv.lock and pyproject.toml. Each entry's kind (file, directory or symlink,
-never following a symlink) must match; files must be byte-identical and symlinks must have
-the same target text. It skips only __pycache__ and the served text files directly in src/
-(a regular file whose name ends in .md, or humans.html; see SERVED_TEXT_SUFFIXES and
-SERVED_TEXT_NAMES), since no kit client fetches them. Those trees come
+fails too) plus uv.lock and pyproject.toml. <tree>/src itself must be a real directory (by
+lstat; a symlinked src fails, since os.walk would follow it). Each entry's kind (file,
+directory or symlink, never following a symlink) must match; files must be byte-identical
+and symlinks must have the same target text. __pycache__ entries are compared like any other
+(CPython can load a matching .pyc instead of the source, and -B stops writing pycs, not
+reading them), so they must be absent from both trees or identical. The only exclusion is the
+served text files directly in src/ (a regular file whose name ends in .md, or humans.html;
+see SERVED_TEXT_SUFFIXES and SERVED_TEXT_NAMES), since no kit client fetches them. Those trees come
 from CONSUMER_LAB_PR545_UPSTREAM (default ~/consumer-lab-upstream-pr545-a84a3ff) and
 CONSUMER_LAB_COMBO_UPSTREAM (default ~/consumer-lab-upstream-combo-6cd4eb9), made with
 `git archive` of the commit and of the merge's tree id.
@@ -79,23 +82,21 @@ def _raise(exc: OSError):
 def src_entries(tree: Path) -> dict[str, str]:
     """{"src/<POSIX path>": kind} for every entry at any depth under <tree>/src, walked
     without following symlinks (a symlinked directory is one "symlink" entry, not descended;
-    a dangling symlink is listed too). __pycache__ directories are not descended. A walk
-    error raises instead of hiding part of the tree."""
+    a dangling symlink is listed too). __pycache__ directories are walked like any other. A
+    walk error raises instead of hiding part of the tree. os.walk follows root itself even
+    with followlinks=False, so callers check that <tree>/src is a real directory first."""
     root = tree / "src"
     entries = {}
     for dirpath, dirnames, filenames in os.walk(root, onerror=_raise, followlinks=False):
         for name in dirnames + filenames:
             path = Path(dirpath, name)
             entries[f"src/{path.relative_to(root).as_posix()}"] = _kind(path)
-        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
     return entries
 
 
 def _is_excluded(rel: str, kind: str) -> bool:
-    """rel is "src/..."; kind is its kind in one tree."""
+    """rel is "src/..."; kind is its kind in one tree. Only the served-text rule."""
     parts = rel.split("/")[1:]
-    if "__pycache__" in parts:
-        return True
     name = parts[-1]
     return (kind == "file" and len(parts) == 1
             and (name.endswith(SERVED_TEXT_SUFFIXES) or name in SERVED_TEXT_NAMES))
@@ -258,8 +259,10 @@ class RuntimeFilesUnchanged(unittest.TestCase):
     and compared_src_paths), never following a symlink: files by bytes, symlinks by target
     text, directories by presence. So a later head that changes, adds or removes one (a
     module, a package directory, an empty directory, a src/pyproject.toml, a compiled
-    extension, a symlink that could shadow an installed library, a dangling symlink) fails
-    this instead of the docs quietly going stale."""
+    extension, a symlink that could shadow an installed library, a dangling symlink, a
+    __pycache__ directory or .pyc) fails this instead of the docs quietly going stale.
+    <tree>/src itself must be a real directory by lstat (a symlinked src fails). The only
+    entries skipped are the served text files directly in src/."""
 
     def _same_runtime_files(self, base: Path, other: Path):
         for tree in (base, other):
@@ -267,6 +270,9 @@ class RuntimeFilesUnchanged(unittest.TestCase):
                 self.skipTest(f"no upstream tree at {tree}: create it with `git archive` from a "
                               "technocore-chat clone (see the module docstring)")
         trees = (base, other)
+        for tree in trees:
+            kind = _kind(tree / "src")
+            self.assertEqual(kind, "dir", f"{tree / 'src'} is a {kind}, not a directory")
         # Walked once per tree; presence below is lstat-based (a dangling symlink is present).
         entries = [src_entries(t) for t in trees]
         for rel in compared_src_paths(*entries):
