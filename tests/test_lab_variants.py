@@ -21,14 +21,16 @@ no runs of their own: the code the kit runs is byte-identical to the pin's and t
 respectively. consumer_lab/server.py imports config, store and app from <tree>/src, and app and
 store import the other src/ modules (didkey, limit, manifest), so the guard compares every
 entry at any depth under src/ (the union of both trees' paths, so an added or removed entry
-fails too) plus uv.lock and pyproject.toml. If <tree>/src exists by lstat it must be a real
-directory, or the test fails (a symlinked src, even a dangling one or one to a directory
-without store.py, fails, since os.walk would follow it). A tree is skipped when its src is
-absent, or when src is a real directory without a regular src/store.py (have_tree uses
-is_file, which follows symlinks, so a dangling src/store.py symlink skips too).
+fails too) plus uv.lock and pyproject.toml. A tree is skipped only when <tree>/src does not
+exist by lstat. If src exists (checked in both trees before any skip), it must be a real
+directory holding a regular src/store.py, both by lstat, or the test fails: a symlinked src,
+even a dangling one, fails (os.walk would follow it), and so does a src whose store.py is
+missing, a directory or a symlink (dangling or not).
 Each entry's kind (file, directory or symlink, never following a symlink) must match; files
 must be byte-identical, and symlinks must have the same target text and must resolve
-(os.path.realpath) inside that tree's own src (a dangling target inside src is allowed).
+(os.path.realpath) inside that tree's own src (a dangling target inside src is allowed), and
+not to an existing served-text file the comparison skips (src/limit.py -> limit.md fails,
+through a chain of links too).
 uv.lock and pyproject.toml must be regular files by lstat (not symlinks) and byte-identical.
 __pycache__ entries are compared like any other (CPython can load a matching .pyc instead
 of the source, and -B stops writing pycs, not reading them), so they must be absent from
@@ -263,24 +265,31 @@ class RuntimeFilesUnchanged(unittest.TestCase):
     adds or removes one (a module, a package directory, an empty directory, a
     src/pyproject.toml, a compiled extension, a symlink that could shadow an installed
     library, a dangling symlink, a __pycache__ directory or .pyc) fails this instead of the
-    docs quietly going stale. If <tree>/src exists by lstat it must be a real directory (a
-    symlinked src fails, dangling or not). A tree is skipped when its src is absent, or when
-    src is a real directory without a regular src/store.py (have_tree, by is_file). A symlink
-    under src must resolve inside that tree's own src (a link to content outside src fails,
-    even with the same target text in both trees). uv.lock and pyproject.toml must be regular
-    files, then byte-identical. The only entries skipped are the served text files directly in
-    src/."""
+    docs quietly going stale. A tree is skipped only when its src is absent by lstat. A src
+    that exists must be a real directory (a symlinked src fails, dangling or not) holding a
+    regular src/store.py by lstat (missing, a directory or a symlink fails). A symlink under
+    src must resolve inside that tree's own src (a link to content outside src fails, even
+    with the same target text in both trees), and not to a served-text file the comparison
+    skips (src/limit.py -> limit.md fails, chains too). uv.lock and pyproject.toml must be
+    regular files, then byte-identical. The only entries skipped are the served text files
+    directly in src/."""
 
     def _same_runtime_files(self, base: Path, other: Path):
         trees = (base, other)
-        # Before the skip: have_tree follows symlinks, so a dangling or empty symlinked src
-        # would otherwise skip instead of failing.
+        # Before the skip, for every src that exists by lstat (in either tree): it must be a
+        # real directory holding a regular store.py (by lstat), else fail. The skip below is
+        # only for an absent src (have_tree would follow symlinks and skip a src without a
+        # regular store.py).
         for tree in trees:
             if os.path.lexists(tree / "src"):
                 kind = _kind(tree / "src")
                 self.assertEqual(kind, "dir", f"{tree / 'src'} is a {kind}, not a directory")
+                store = tree / "src" / "store.py"
+                found = _kind(store) if os.path.lexists(store) else None
+                self.assertEqual(found, "file", f"{store} is missing" if found is None
+                                 else f"{store} is a {found}, not a regular file")
         for tree in trees:
-            if not have_tree(tree):
+            if not os.path.lexists(tree / "src"):
                 self.skipTest(f"no upstream tree at {tree}: create it with `git archive` from a "
                               "technocore-chat clone (see the module docstring)")
         # Walked once per tree; presence below is lstat-based (a dangling symlink is present).
@@ -303,6 +312,13 @@ class RuntimeFilesUnchanged(unittest.TestCase):
                         target = os.path.realpath(t / rel)
                         self.assertEqual(os.path.commonpath([root, target]), root,
                                          f"{rel} in {t} resolves to {target}, outside {root}")
+                        # Inside src, the target must not be a file the comparison skips
+                        # (realpath follows the whole chain).
+                        if os.path.lexists(target):
+                            served = f"src/{Path(target).relative_to(root).as_posix()}"
+                            self.assertFalse(_is_excluded(served, _kind(Path(target))),
+                                             f"{rel} in {t} resolves to served text {served}, "
+                                             "which is not compared")
                     self.assertEqual(os.readlink(base / rel), os.readlink(other / rel),
                                      f"{rel} points elsewhere in {other} than in {base}")
         for rel in LOCK_FILES:
