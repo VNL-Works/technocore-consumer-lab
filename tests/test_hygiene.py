@@ -12,6 +12,12 @@
   a SIGINT that lands just before the kill) are deferred until the group is killed (a stop
   signal is then dropped with a kit line, and cannot mask a terminating one), and SIGINT's
   handler is restored last; `run_client` off the main thread is a setup error.
+- The deferred signals stay blocked in the main thread while their handlers are restored, and
+  the kit's own threads (the upstream server's, the fault proxy's and the threads they start)
+  block them for their whole life, so one sent to the process then stays pending and reaches
+  its restored handler once (a KeyboardInterrupt it raises comes after the re-delivery); a
+  partial line the client leaves on its worker's stderr never joins a kit line (`kept`, the
+  stop-signal line, the parent's lines after its echo).
 """
 
 import contextlib
@@ -20,9 +26,11 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -32,7 +40,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from consumer_lab import cli  # noqa: E402
-from consumer_lab.scenarios import run_client  # noqa: E402
+from consumer_lab.scenarios import DEFERRED_SIGNALS, run_client  # noqa: E402
 
 TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
 HAVE_TREE = (TREE / "src" / "store.py").is_file()
@@ -528,6 +536,138 @@ class DeferredSignalFromTheGroup(unittest.TestCase):
         self.assertEqual(json.loads(result_json.read_text()), {"error": "KeyboardInterrupt()", "exit_code": 1, "id": "W0"})
 
 
+# Writes PARTIAL (no newline) to its worker's stderr, once per scenario (TC_STATE_DIR keeps a
+# marker across the cycles of a reader scenario), then exits 0 without events.
+PARTIAL_LINE = r"""
+import os
+marker = os.path.join(os.environ["TC_STATE_DIR"], "partial-written")
+if not os.path.exists(marker):
+    open(marker, "w").close()
+    fd = os.open(f"/proc/{os.getppid()}/fd/2", os.O_WRONLY | os.O_APPEND)
+    os.write(fd, b"PARTIAL")
+    os.close(fd)
+"""
+
+# Writes PARTIAL to its worker's stderr, then kills the worker outright: the stderr tail the
+# parent echoes ends without a newline, and the parent's own `kept` line comes next.
+PARTIAL_THEN_KILL = r"""
+import os, signal
+fd = os.open(f"/proc/{os.getppid()}/fd/2", os.O_WRONLY | os.O_APPEND)
+os.write(fd, b"PARTIAL")
+os.close(fd)
+os.kill(os.getppid(), signal.SIGKILL)
+"""
+
+# Writes PARTIAL to its worker's stderr, then sends the worker SIGTSTP (deferred, then dropped
+# with the kit's stop-signal line).
+PARTIAL_THEN_SIGTSTP = r"""
+import os, signal
+fd = os.open(f"/proc/{os.getppid()}/fd/2", os.O_WRONLY | os.O_APPEND)
+os.write(fd, b"PARTIAL")
+os.close(fd)
+os.kill(os.getppid(), signal.SIGTSTP)
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class KitLinesStartOnAFreshLine(unittest.TestCase):
+    """A partial line the client leaves on its worker's stderr never joins a kit line (v0.2.4):
+    the worker's `kept` and stop-signal lines and the parent's lines after its echo start on a
+    fresh line, and a run without a partial line gains no empty line."""
+
+    def kept_entries(self) -> set[str]:
+        return {p.name for p in Path(tempfile.gettempdir()).glob("consumer-lab-[sw][0-9]-*")}
+
+    def run_kit(self, source: str, scenario: str, *extra: str, short: bool = False) -> tuple[int, str]:
+        """Run `scenario` with the client `source`; return the exit code and the kit's stderr
+        alone (stdout holds the verdict lines). With `short`, WORKER_TIMEOUT is 8 s (a stop
+        signal re-delivered to the worker would fail in seconds). The run gets its own process
+        group, as in `DeferredSignalFromTheGroup.run_signals`. Whatever the run left in the
+        temp dir is removed afterwards."""
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-nclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        script = tmp / "client.py"
+        script.write_text(source)
+        before = self.kept_entries()
+        head = [sys.executable, "-B", "-c", SHORT_TIMEOUT_RUN] if short else [sys.executable, "-m", "consumer_lab"]
+        cmd = [*head, "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", scenario, *extra]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=300, process_group=0)
+        for name in self.kept_entries() - before:
+            self.addCleanup(remove_entry, Path(tempfile.gettempdir()) / name)
+        return proc.returncode, proc.stderr.decode("utf-8", errors="replace")
+
+    def assert_kept_line(self, stderr: str, scenario: str) -> None:
+        lines = stderr.splitlines()
+        kept = [ln for ln in lines if ln.startswith("kept ")]
+        self.assertTrue(kept, stderr)
+        for line in kept:
+            path = Path(line.removeprefix("kept "))
+            self.assertTrue(path.name.startswith(f"consumer-lab-{scenario.lower()}-"), stderr)
+            self.assertTrue(path.is_dir(), stderr)
+            self.assertEqual(line, f"kept {path}", stderr)
+        self.assertIn("PARTIAL", lines, stderr)  # the client's text, on a line of its own
+
+    def test_worker_kept_line_after_a_partial_line_reader(self):
+        code, stderr = self.run_kit(PARTIAL_LINE, "S1", "--keep-root")
+        self.assertIn(code, (0, 1), stderr)
+        self.assert_kept_line(stderr, "S1")
+        self.assertEqual(len([ln for ln in stderr.splitlines() if ln.startswith("kept ")]), 1, stderr)
+
+    def test_worker_kept_line_after_a_partial_line_writer(self):
+        code, stderr = self.run_kit(PARTIAL_LINE, "W0", "--keep-root")
+        self.assertIn(code, (0, 1), stderr)
+        self.assert_kept_line(stderr, "W0")
+        self.assertEqual(len([ln for ln in stderr.splitlines() if ln.startswith("kept ")]), 1, stderr)
+
+    def test_parent_kept_line_after_a_partial_tail(self):
+        code, stderr = self.run_kit(PARTIAL_THEN_KILL, "W0", "--keep-root")
+        self.assertEqual(code, 2, stderr)
+        self.assert_kept_line(stderr, "W0")
+        self.assertEqual(stderr.splitlines()[-1], "setup error: W0: worker exited -9: killed by signal 9", stderr)
+
+    def test_stop_signal_line_after_a_partial_line(self):
+        code, stderr = self.run_kit(PARTIAL_THEN_SIGTSTP, "W0", short=True)
+        self.assertIn(code, (0, 1), stderr)
+        lines = stderr.splitlines()
+        self.assertIn(DeferredSignalFromTheGroup.STOP_LINE, lines, stderr)
+        self.assertIn("PARTIAL", lines, stderr)
+
+    def test_runs_without_a_partial_line_gain_no_empty_line(self):
+        for scenario in ("S1", "W0"):
+            with self.subTest(scenario=scenario):
+                code, stderr = self.run_kit("", scenario, "--keep-root")
+                self.assertIn(code, (0, 1), stderr)
+                self.assertEqual(len([ln for ln in stderr.splitlines() if ln.startswith("kept ")]), 1, stderr)
+                self.assertNotIn("\n\n", stderr)
+                self.assertFalse(stderr.startswith("\n"), stderr)
+
+
+def sigblk(status_text: str) -> set[int]:
+    """The blocked signal numbers from the `SigBlk:` line of a /proc/.../status text."""
+    for line in status_text.splitlines():
+        if line.startswith("SigBlk:"):
+            bits = int(line.split()[1], 16)
+            return {n for n in range(1, 65) if bits >> (n - 1) & 1}
+    raise AssertionError(f"no SigBlk line in {status_text!r}")
+
+
+def blockable_deferred_signals() -> set[int]:
+    """The deferred signals a thread can block, as a fresh thread that blocks them sees its
+    mask (the C library's reserved numbers, 32 and 33 on glibc, are not valid signals)."""
+    out: dict[str, set[int]] = {}
+
+    def probe():
+        valid = set(DEFERRED_SIGNALS) & signal.valid_signals()
+        before = {int(s) for s in signal.pthread_sigmask(signal.SIG_BLOCK, valid)}
+        out["added"] = {int(s) for s in signal.pthread_sigmask(signal.SIG_BLOCK, [])} - before
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join(10)
+    return out["added"]
+
+
 @unittest.skipUnless(hasattr(os, "killpg") and Path("/proc").is_dir(), "needs POSIX process groups and /proc")
 class RunClientDefersSignals(unittest.TestCase):
     def test_sigint_just_before_the_group_kill_does_not_skip_it(self):
@@ -579,6 +719,137 @@ class RunClientDefersSignals(unittest.TestCase):
         self.assertEqual(sorted(restores), sorted(installs[:set_]))
         self.assertEqual({s: signal.getsignal(s) for s in before}, before)
 
+    def restore_hook(self, after_first_restore):
+        """A `signal.signal` stand-in that calls `after_first_restore()` once, right after the
+        first handler `run_client` restores (the second call for a signal number), and records
+        the blocked mask at every restore."""
+        real_signal = signal.signal
+        installed: set[int] = set()
+        masks: list[tuple[int, set[int]]] = []
+
+        def hooked(sig, handler):
+            restoring = int(sig) in installed
+            if restoring:
+                masks.append((int(sig), {int(s) for s in signal.pthread_sigmask(signal.SIG_BLOCK, [])}))
+            previous = real_signal(sig, handler)  # a refused number raises before it is logged
+            if not restoring:
+                installed.add(int(sig))
+            elif len(masks) == 1:
+                after_first_restore()
+            return previous
+
+        return hooked, masks
+
+    def keep_handler(self, sig, handler):
+        before = signal.signal(sig, handler)
+        self.addCleanup(signal.signal, sig, before)
+
+    def test_signal_during_restore_reaches_the_restored_handler_once(self):
+        # A SIGUSR1 sent while the handlers are being restored (after the first one is back)
+        # reaches SIGUSR1's previous handler exactly once: not lost, not delivered twice.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        got: list[int] = []
+        self.keep_handler(signal.SIGUSR1, lambda signum, _frame: got.append(signum))
+        hooked, masks = self.restore_hook(lambda: os.kill(os.getpid(), signal.SIGUSR1))
+        with mock.patch.object(signal, "signal", side_effect=hooked):
+            run_client(["true"], dict(os.environ), tmp / "client.stderr", 10.0)
+        self.assertTrue(masks)  # the hook ran
+        self.assertEqual(got, [signal.SIGUSR1])
+
+    def test_deferred_signals_stay_blocked_while_handlers_are_restored(self):
+        # The window inside signal.signal() is in C and cannot be hit from Python; what closes
+        # it is that no deferred signal can be delivered while any handler is being restored.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        hooked, masks = self.restore_hook(lambda: None)
+        mask_before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        with mock.patch.object(signal, "signal", side_effect=hooked):
+            run_client(["true"], dict(os.environ), tmp / "client.stderr", 10.0)
+        restored = {sig for sig, _ in masks}
+        self.assertIn(int(signal.SIGINT), restored)
+        self.assertIn(int(signal.SIGUSR1), restored)
+        unblocked = [(sig, sorted(restored - mask)) for sig, mask in masks if not restored <= mask]
+        self.assertEqual(unblocked, [])
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), mask_before)  # mask is back
+
+    def test_handler_raising_when_the_mask_is_restored_still_redelivers(self):
+        # A SIGINT that arrives mid-restore raises KeyboardInterrupt from the default handler;
+        # the SIGUSR2 the client sent during the cycle is still re-delivered first, once.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        got: list[int] = []
+        self.keep_handler(signal.SIGUSR2, lambda signum, _frame: got.append(signum))
+        self.keep_handler(signal.SIGINT, signal.default_int_handler)
+        hooked, masks = self.restore_hook(lambda: os.kill(os.getpid(), signal.SIGINT))
+        argv = ["sh", "-c", "kill -USR2 $PPID"]
+        with mock.patch.object(signal, "signal", side_effect=hooked):
+            with self.assertRaises(KeyboardInterrupt):
+                run_client(argv, dict(os.environ), tmp / "client.stderr", 10.0)
+        self.assertTrue(masks)
+        self.assertEqual(got, [signal.SIGUSR2])
+        self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+    def kit_threads_alive(self) -> list[threading.Thread]:
+        """Start the kit's fault proxy (its serve thread is started the way the upstream thread
+        is) and keep one of its request threads busy with a connection that sends nothing.
+        Returns the threads this added; they end in the test's cleanup."""
+        from consumer_lab.proxy import FaultProxy, Plan
+
+        before = set(threading.enumerate())
+        proxy = FaultProxy("http://127.0.0.1:9", Plan(room="lab-c9"))  # the origin is never used
+        self.addCleanup(proxy.stop)
+        conn = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+        self.addCleanup(conn.close)  # runs before proxy.stop: the request thread reads EOF
+        deadline = time.monotonic() + 5
+        while len(set(threading.enumerate()) - before) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        added = sorted(set(threading.enumerate()) - before, key=lambda t: t.name)
+        self.assertEqual(len(added), 2, added)  # fault-proxy and one request thread
+        return added
+
+    def test_kit_threads_block_the_deferred_signals(self):
+        # Every thread the kit starts (here the fault proxy's serve thread and a request thread
+        # it started) has every blockable deferred signal blocked; starting them leaves the
+        # starting thread's mask as it was.
+        mask_before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        added = self.kit_threads_alive()
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), mask_before)
+        want = blockable_deferred_signals()
+        self.assertIn(int(signal.SIGTERM), want)
+        for t in added:
+            with self.subTest(thread=t.name):
+                status = Path(f"/proc/self/task/{t.native_id}/status").read_text()
+                self.assertEqual(sorted(want - sigblk(status)), [])
+
+    def test_signal_to_the_process_during_restore_stays_pending_with_kit_threads_alive(self):
+        # A process-directed SIGUSR1 sent mid-restore, while the main thread blocks it and kit
+        # threads are alive, is not taken by them: it is still pending after a pause, and only
+        # reaches SIGUSR1's restored handler, exactly once, when run_client puts the mask back.
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-hygiene-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.kit_threads_alive()
+        main_tid = threading.main_thread().native_id
+        others = [tid for tid in os.listdir("/proc/self/task") if int(tid) != main_tid]
+        self.assertGreaterEqual(len(others), 2, others)
+        got: list[int] = []
+        self.keep_handler(signal.SIGUSR1, lambda signum, _frame: got.append(signum))
+        seen: dict[str, object] = {}
+
+        def send_to_the_process():
+            os.kill(os.getpid(), signal.SIGUSR1)  # to the process: an unblocked thread takes it
+            time.sleep(0.2)
+            seen["pending"] = signal.SIGUSR1 in signal.sigpending()
+            seen["handled"] = list(got)
+
+        hooked, masks = self.restore_hook(send_to_the_process)
+        with mock.patch.object(signal, "signal", side_effect=hooked):
+            run_client(["true"], dict(os.environ), tmp / "client.stderr", 10.0)
+        self.assertTrue(masks)  # the hook ran
+        self.assertEqual(seen, {"pending": True, "handled": []})
+        self.assertEqual(got, [signal.SIGUSR1])
+        self.assertNotIn(signal.SIGUSR1, signal.sigpending())
+
     def test_off_the_main_thread_is_a_setup_error(self):
         from consumer_lab.server import SetupError
 
@@ -602,6 +873,70 @@ class RunClientDefersSignals(unittest.TestCase):
         self.assertIsInstance(got[0], SetupError)
         self.assertIn("main thread", str(got[0]))
         self.assertFalse(marker.exists())  # no client was started
+
+
+# Records, at every cycle, each thread of its worker (/proc/<ppid>/task/*): its tid and its
+# whole status text (Name, SigBlk, ...). The test prepends OUT_DIR.
+THREAD_MASKS = r"""
+import json, os
+ppid = os.getppid()
+tasks = []
+for tid in sorted(os.listdir(f"/proc/{ppid}/task"), key=int):
+    try:
+        with open(f"/proc/{ppid}/task/{tid}/status") as f:
+            status = f.read()
+    except FileNotFoundError:
+        continue  # the thread ended meanwhile
+    tasks.append({"tid": int(tid), "status": status})
+n = len(os.listdir(OUT_DIR))
+with open(os.path.join(OUT_DIR, f".cycle-{n}"), "w") as f:
+    json.dump({"ppid": ppid, "tasks": tasks}, f)
+os.rename(os.path.join(OUT_DIR, f".cycle-{n}"), os.path.join(OUT_DIR, f"cycle-{n}.json"))
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class KitThreadsBlockTheDeferredSignals(unittest.TestCase):
+    """In a real worker, during every client cycle, every thread but the main one blocks the
+    deferred signals (the upstream server's thread, the fault proxy's and the threads they
+    started), and the main thread blocks none of SIGINT, SIGTERM, SIGUSR1."""
+
+    def cycles(self, scenario: str) -> list[dict]:
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-tclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = tmp / "cycles"
+        out.mkdir()
+        script = tmp / "client.py"
+        script.write_text(f"OUT_DIR = {str(out)!r}\n" + THREAD_MASKS)
+        cmd = [sys.executable, "-m", "consumer_lab", "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", scenario]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=300)
+        output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        self.assertIn(proc.returncode, (0, 1), output)  # no events: a verdict, not a setup error
+        found = sorted(out.glob("cycle-*.json"), key=lambda p: int(p.stem.split("-")[1]))
+        self.assertTrue(found, output)
+        return [json.loads(p.read_text()) for p in found]
+
+    def check(self, scenario: str, other_threads_at_least: int) -> None:
+        want = blockable_deferred_signals()
+        main_must_take = {int(signal.SIGINT), int(signal.SIGTERM), int(signal.SIGUSR1)}
+        for i, cycle in enumerate(self.cycles(scenario)):
+            main = [t for t in cycle["tasks"] if t["tid"] == cycle["ppid"]]
+            others = [t for t in cycle["tasks"] if t["tid"] != cycle["ppid"]]
+            with self.subTest(cycle=i):
+                self.assertEqual(len(main), 1, cycle)
+                self.assertEqual(main_must_take & sigblk(main[0]["status"]), set(), cycle)
+                self.assertGreaterEqual(len(others), other_threads_at_least, cycle)
+                unblocked = {t["tid"]: sorted(want - sigblk(t["status"])) for t in others}
+                summary = [ln for t in cycle["tasks"] for ln in t["status"].splitlines()
+                           if ln.startswith(("Name:", "Pid:", "SigBlk:"))]
+                self.assertEqual({tid: s for tid, s in unblocked.items() if s}, {}, summary)
+
+    def test_reader_worker_threads_block_the_deferred_signals(self):
+        self.check("S1", 1)  # at least the upstream thread
+
+    def test_writer_worker_threads_block_the_deferred_signals(self):
+        self.check("W0", 2)  # at least the upstream and fault-proxy threads
 
 
 if __name__ == "__main__":

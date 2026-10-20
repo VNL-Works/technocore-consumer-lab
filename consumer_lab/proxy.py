@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
+from consumer_lab.scenarios import start_kit_thread
 from consumer_lab.server import SetupError
 
 CLIENT_READ_TIMEOUT = 15.0  # a client that stops sending mid-request is dropped after this
@@ -208,7 +209,9 @@ class FaultProxy:
         self._thread = threading.Thread(
             target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, name="fault-proxy", daemon=True
         )
-        self._thread.start()
+        # The deferred signals stay blocked in this thread and in the request threads it starts,
+        # so a deferred signal sent to the worker process is taken by the main thread, not here.
+        start_kit_thread(self._thread)
 
     # ------------------------------------------------------------------ lifecycle
 

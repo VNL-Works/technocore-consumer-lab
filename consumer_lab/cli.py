@@ -148,7 +148,7 @@ def _print_result(result: dict) -> None:
 def _worker(args) -> int:
     """Run one scenario in this process; print one JSON line with the result."""
     from consumer_lab.judge import judge
-    from consumer_lab.scenarios import SCENARIOS, Kit
+    from consumer_lab.scenarios import SCENARIOS, Kit, start_fresh_stderr_line
     from consumer_lab.server import Upstream
     from consumer_lab.writers import WRITER_SCENARIOS
 
@@ -214,6 +214,7 @@ def _worker(args) -> int:
         if args.keep_root:
             if kit is not None:
                 outcome["cycle_exit_codes"] = [c.exit_code for c in kit.cycles]
+            start_fresh_stderr_line()  # the client may have left a partial line on this stderr
             _write_kept_result(workdir, outcome)
             print(f"kept {workdir}", file=sys.stderr)
         else:
@@ -222,6 +223,7 @@ def _worker(args) -> int:
 
 def _writer_worker(args, scenario) -> int:
     """The writer twin of `_worker`: one scenario, one client cycle through the proxy."""
+    from consumer_lab.scenarios import start_fresh_stderr_line
     from consumer_lab.server import Upstream
     from consumer_lab.writer_judge import judge_write
     from consumer_lab.writers import run_writer
@@ -285,6 +287,7 @@ def _writer_worker(args, scenario) -> int:
         if args.keep_root:
             if run is not None:
                 outcome["cycle_exit_codes"] = [run.cycle.exit_code]
+            start_fresh_stderr_line()  # the client may have left a partial line on this stderr
             _write_kept_result(workdir, outcome)
             print(f"kept {workdir}", file=sys.stderr)
         else:
@@ -408,7 +411,7 @@ def _run(args) -> int:
         if skipped:
             sys.stderr.write(f"[worker stderr: {skipped} earlier bytes not shown]\n")
         if stderr.strip():
-            sys.stderr.write(stderr)
+            sys.stderr.write(stderr if stderr.endswith("\n") else stderr + "\n")  # own lines start fresh
         if returncode != EXIT_PASS:
             detail = _worker_failure(returncode, stderr)
             setup_error = f"{sid}: worker exited {returncode}: {detail}"

@@ -28,7 +28,8 @@ even a dangling one, fails (os.walk would follow it), and so does a src whose st
 missing, a directory or a symlink (dangling or not).
 Each entry's kind (file, directory or symlink, never following a symlink) must match; files
 must be byte-identical, and symlinks must have the same target text and must resolve
-(os.path.realpath) inside that tree's own src (a dangling target inside src is allowed), and
+(os.path.realpath) inside that tree's own src (a dangling target inside src is allowed; a
+symlink loop, src/loop -> loop or a -> b -> a, fails), and
 not to an existing served-text file the comparison skips (src/limit.py -> limit.md fails,
 through a chain of links too).
 uv.lock and pyproject.toml must be regular files by lstat (not symlinks) and byte-identical.
@@ -269,10 +270,10 @@ class RuntimeFilesUnchanged(unittest.TestCase):
     that exists must be a real directory (a symlinked src fails, dangling or not) holding a
     regular src/store.py by lstat (missing, a directory or a symlink fails). A symlink under
     src must resolve inside that tree's own src (a link to content outside src fails, even
-    with the same target text in both trees), and not to a served-text file the comparison
-    skips (src/limit.py -> limit.md fails, chains too). uv.lock and pyproject.toml must be
-    regular files, then byte-identical. The only entries skipped are the served text files
-    directly in src/."""
+    with the same target text in both trees; a dangling one passes, a symlink loop fails), and
+    not to a served-text file the comparison skips (src/limit.py -> limit.md fails, chains
+    too). uv.lock and pyproject.toml must be regular files, then byte-identical. The only
+    entries skipped are the served text files directly in src/."""
 
     def _same_runtime_files(self, base: Path, other: Path):
         trees = (base, other)
@@ -312,6 +313,9 @@ class RuntimeFilesUnchanged(unittest.TestCase):
                         target = os.path.realpath(t / rel)
                         self.assertEqual(os.path.commonpath([root, target]), root,
                                          f"{rel} in {t} resolves to {target}, outside {root}")
+                        # Non-strict realpath returns a symlink only for a loop (a -> a,
+                        # a -> b -> a); a dangling target is a path that does not exist.
+                        self.assertFalse(os.path.islink(target), f"{rel} in {t} is a symlink loop")
                         # Inside src, the target must not be a file the comparison skips
                         # (realpath follows the whole chain).
                         if os.path.lexists(target):

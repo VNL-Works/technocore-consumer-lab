@@ -14,6 +14,7 @@ import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -198,6 +199,29 @@ UNDEFERRABLE: set[int] = set()  # candidates the platform refused a handler for,
 STOP_SIGNALS = frozenset(int(getattr(signal, n)) for n in ("SIGTSTP", "SIGTTIN", "SIGTTOU") if hasattr(signal, n))
 
 
+def start_kit_thread(thread: threading.Thread) -> None:
+    """Start `thread` with every signal in `DEFERRED_SIGNALS` blocked in it for its whole life.
+
+    A new thread inherits the signal mask of the thread that starts it, so the signals are
+    blocked in the calling thread around `thread.start()` and the caller's own mask is put back
+    afterwards (a signal that arrived meanwhile is delivered then). Threads that `thread` starts
+    in turn inherit its mask. The upstream server thread and the fault proxy's serve thread are
+    started this way, so they and the threads they start (asyncio's and anyio's worker threads,
+    the proxy's request threads) never take a process-directed deferred signal; of the kit's
+    threads only the main thread can. While `run_client` restores the handlers the main thread
+    blocks them too, so such a signal then stays pending for the process, provided no thread
+    started by other means (not covered here) leaves it unblocked. A deferred signal sent to
+    one of these threads itself (tgkill) stays pending in that thread and is never handled.
+    The C library's reserved numbers (32 and 33 on glibc) are left out: they are not valid
+    signals to block.
+    """
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, set(DEFERRED_SIGNALS) & signal.valid_signals())
+    try:
+        thread.start()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
 def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout: float) -> tuple[int | None, bool]:
     """Run one client cycle in its own session. Returns (exit code or None, timed out).
 
@@ -208,14 +232,18 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
 
     While the cycle runs, the asynchronous terminating and stop signals in `DEFERRED_SIGNALS`
     (which a client can send to this process) are only recorded. After the group kill and the
-    reap, the previous handlers come back (SIGINT's last) and each recorded terminating signal is
-    re-delivered once, in the order this process handled them (not necessarily the order they
-    were sent), so this process then ends as it would have, but only after the client's group is
-    dead. A recorded stop signal (`STOP_SIGNALS`) is dropped, with a kit line on stderr naming
-    it. Not deferred: SIGKILL and SIGSTOP, which cannot be caught; the fault signals
-    SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGABRT and SIGSYS; and the signals reserved by the
-    C library (32 on glibc), which refuse a handler (`UNDEFERRABLE`). A client that sends one of
-    those can still end (or stop) this worker before the kill and leave its group alive.
+    reap, the previous handlers come back, SIGINT's last. Meanwhile this thread blocks the
+    deferred signals, and the kit's other threads block them for their whole life
+    (`start_kit_thread`), so one sent to this thread or to the process then stays pending
+    (unless a thread started by other means leaves it unblocked) and reaches its restored
+    handler once the mask is back. Then each recorded terminating signal is re-delivered once,
+    in the order this process handled them (not necessarily the order they were sent), so this
+    process ends as it would have, but only after the client's group is dead. A recorded stop
+    signal (`STOP_SIGNALS`) is dropped, with a kit line on stderr naming it. Not deferred:
+    SIGKILL and SIGSTOP, which cannot be caught; the fault signals SIGSEGV, SIGBUS, SIGFPE,
+    SIGILL, SIGTRAP, SIGABRT and SIGSYS; and the signals reserved by the C library (32 on
+    glibc), which refuse a handler (`UNDEFERRABLE`). A client that sends one of those can
+    still end (or stop) this worker before the kill and leave its group alive.
     Must run on the main thread (Python handlers are set and run there), else a SetupError.
     """
     if threading.current_thread() is not threading.main_thread():
@@ -257,18 +285,56 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
                 pass  # the group is already empty (or its id now belongs to someone else)
             proc.wait()
     finally:
-        # SIGINT's handler last: a SIGINT arriving mid-restore is still only recorded until
-        # every other handler is back.
-        for sig in sorted(previous, key=lambda s: s == signal.SIGINT):
-            handler = previous[sig]
-            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        # This thread blocks every deferred signal while the handlers are restored. The kit's
+        # other threads block them for their whole life (start_kit_thread), so one sent to this
+        # thread or to the process meanwhile (even inside signal.signal(), between its pending
+        # check and the swap) stays pending and reaches the restored handler, once, when the
+        # old mask is back. A thread started by other means that leaves it unblocked could
+        # still take it. SIGINT's handler is still restored last.
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, previous) if previous else None
+        raised: BaseException | None = None
+        try:
+            for sig in sorted(previous, key=lambda s: s == signal.SIGINT):
+                handler = previous[sig]
+                signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        finally:
+            if old_mask is not None:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)  # pending ones run here
+                except BaseException as exc:  # noqa: BLE001 - KeyboardInterrupt; raised below
+                    raised = exc
         dropped = [sig for sig in dict.fromkeys(arrived) if sig in STOP_SIGNALS]
         if dropped:
             names = ", ".join(signal.Signals(sig).name for sig in dropped)
+            start_fresh_stderr_line()
             sys.stderr.write(f"stop signal during the client cycle not re-delivered: {names}\n")
             sys.stderr.flush()
-        _redeliver([sig for sig in arrived if sig not in STOP_SIGNALS])
+        try:
+            _redeliver([sig for sig in arrived if sig not in STOP_SIGNALS])
+        except BaseException as exc:  # noqa: BLE001 - raised below, after the rest
+            raised = raised or exc
+        if raised is not None:
+            raise raised
     return exit_code, timed_out
+
+
+def start_fresh_stderr_line() -> None:
+    r"""Write one "\n" to stderr if fd 2 is a regular file that already holds bytes and whose
+    last byte is not a newline. The client shares the worker's stderr (it can write to
+    /proc/<ppid>/fd/2), so a partial line it left would otherwise become the start of the
+    kit's next line. When fd 2 is not a regular file (or cannot be read back), nothing extra
+    is written; output that already ends with a newline gains no blank line."""
+    try:
+        sys.stderr.flush()
+        st = os.fstat(2)
+        if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+            return
+        last = os.pread(2, 1, st.st_size - 1)
+    except (OSError, ValueError):
+        return
+    if last and last != b"\n":
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def _redeliver(arrived: list[int]) -> None:

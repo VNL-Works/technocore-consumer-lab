@@ -156,9 +156,13 @@ class Upstream:
             access_log=False,
             lifespan="on",
         )
+        from consumer_lab.scenarios import start_kit_thread  # here: scenarios imports this module
+
         self._server = uvicorn.Server(cfg)
         self._thread = threading.Thread(target=self._server.run, name="upstream", daemon=True)
-        self._thread.start()
+        # The deferred signals stay blocked in this thread and in every thread it starts, so a
+        # deferred signal sent to the worker process is taken by the main thread, not here.
+        start_kit_thread(self._thread)
         deadline = time.monotonic() + ready_timeout
         while not self._server.started:
             if not self._thread.is_alive() or time.monotonic() > deadline:
