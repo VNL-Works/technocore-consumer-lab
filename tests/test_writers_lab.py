@@ -7,6 +7,7 @@ scenario. Needs Linux, the venv from scripts/setup_wsl.sh and the upstream tree
 (CONSUMER_LAB_UPSTREAM, default ~/consumer-lab-upstream-0e47f77); skipped loudly without it.
 """
 
+import io
 import json
 import os
 import re
@@ -17,6 +18,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
@@ -669,6 +672,47 @@ class SeedRepost(unittest.TestCase):
 
     def test_the_same_client_without_the_repost_passes(self):
         self.check("none", "PASS", 0)
+
+
+class SeedSeqFromThePostResponse(unittest.TestCase):
+    """`writers._seed` on a stubbed seed POST response (no upstream needed): the seed is
+    identified by the `seq` in it, so a response without an integer seq (a bool included) is a
+    failed precondition, never a guess."""
+
+    MESSAGE = r"^lab-w0: precondition failed: the seed POST's response carries no integer seq$"
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO))
+        from consumer_lab import writers as W
+        from consumer_lab.scenarios import NotDeterministic
+        self.W, self.ND = W, NotDeterministic
+
+    def seed(self, posted: dict):
+        body = json.dumps({"posted": posted}).encode()
+        opened = []
+
+        def fake_open(req, timeout=None):
+            opened.append(req.full_url)
+            return io.BytesIO(body)
+
+        try:
+            with mock.patch.object(self.W._NO_PROXY, "open", fake_open):
+                return self.W._seed(SimpleNamespace(url="http://127.0.0.1:9"), "lab-w0")
+        finally:
+            self.assertEqual(opened, ["http://127.0.0.1:9/r/lab-w0?format=json"])  # one POST, stubbed
+
+    def test_an_integer_seq_is_returned(self):
+        self.assertEqual(self.seed({"from": "lab", "seq": 7, "text": self.W.SEED_TEXT}), 7)
+
+    def test_a_missing_or_non_integer_seq_is_not_deterministic(self):
+        for name, extra in (("missing", {}), ("null", {"seq": None}), ("string", {"seq": "1"}),
+                            ("float", {"seq": 1.0})):
+            with self.subTest(name), self.assertRaisesRegex(self.ND, self.MESSAGE):
+                self.seed({"from": "lab", "text": self.W.SEED_TEXT, **extra})
+
+    def test_a_bool_seq_is_not_deterministic(self):
+        with self.assertRaisesRegex(self.ND, self.MESSAGE):
+            self.seed({"from": "lab", "seq": True, "text": self.W.SEED_TEXT})
 
 
 class ReportLog(unittest.TestCase):

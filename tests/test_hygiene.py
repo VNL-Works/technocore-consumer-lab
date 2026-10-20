@@ -23,6 +23,9 @@
   not even upstream's shutdown counter flush, and `--keep-root` writes no result.json there.
   One that swaps and then SIGINTs its worker (the cycle then ends in KeyboardInterrupt, before
   the check) ends with the worker's -2, and the kit creates nothing there either.
+- C12: replacing only the store root `<workdir>/root` with a link is caught the same way (reader
+  and writer); SIGTERM or SIGHUP to `run` during a cycle stops the worker, removes the temp dirs,
+  writes the report as a setup error and ends the parent by that signal, leaving no process.
 """
 
 import contextlib
@@ -460,6 +463,160 @@ class WorkdirReplacedDuringACycle(unittest.TestCase):
 
     def test_writer_sigint_after_the_swap_creates_nothing_outside(self):
         self.check("W0", sigint=True)
+
+
+# Set WHERE, AWAY and OUTSIDE before this source. Keeps its workdir but renames the store root
+# `<workdir>/root` to AWAY and puts a link to the dir OUTSIDE in its place, then exits 0; WHERE
+# gets the workdir's path.
+SWAP_ROOT_THEN_EXIT = r"""
+import os
+workdir = os.path.dirname(os.environ["TC_EVENTS"])
+with open(WHERE, "w") as f:
+    f.write(workdir)
+os.rename(os.path.join(workdir, "root"), AWAY)
+os.symlink(OUTSIDE, os.path.join(workdir, "root"))
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class StoreRootReplacedDuringACycle(unittest.TestCase):
+    """v0.2.4 C12: a client that keeps its workdir but replaces `<workdir>/root` with a link to
+    an outside dir and exits 0 ends the run with a setup error right after that cycle, naming the
+    root; upstream stops without its shutdown hooks and nothing is created in the outside dir."""
+
+    def check(self, scenario: str) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-rclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)  # holds AWAY (the renamed root) and OUTSIDE
+        outside = tmp / "outside"
+        outside.mkdir()
+        away = tmp / "away"
+        where = tmp / "workdir.txt"
+        script = tmp / "client.py"
+        script.write_text(
+            f"WHERE = {str(where)!r}\nAWAY = {str(away)!r}\nOUTSIDE = {str(outside)!r}\n" + SWAP_ROOT_THEN_EXIT
+        )
+        out = tmp / "report.json"
+        pattern = f"consumer-lab-{scenario.lower()}-*"
+        before = {p.name for p in Path(tempfile.gettempdir()).glob(pattern)}
+        cmd = [sys.executable, "-m", "consumer_lab", "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", scenario, "--json", str(out)]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=300)
+        left = sorted({p.name for p in Path(tempfile.gettempdir()).glob(pattern)} - before)
+        for name in left:  # whatever this run left (a link, too), the test removes; never a target
+            self.addCleanup(remove_entry, Path(tempfile.gettempdir()) / name)
+        listing = sorted(str(p.relative_to(outside)) for p in outside.rglob("*"))
+        output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        detail = f"{output}\noutside dir holds: {listing}"
+        self.assertEqual(listing, [], detail)  # nothing created through the link, at any depth
+        self.assertTrue(away.is_dir(), detail)  # the swap did happen
+        self.assertEqual(proc.returncode, 2, detail)
+        self.assertEqual(left, [], detail)  # the worker removed its workdir (and the link in it)
+        workdir = where.read_text()
+        expected = f"{scenario}: worker exited 2: store root {workdir}/root was replaced during the client cycle"
+        self.assertEqual(json.loads(out.read_text())["setup_error"], expected, detail)
+
+    def test_reader_stops_when_the_store_root_is_replaced(self):
+        self.check("S1")
+
+    def test_writer_stops_when_the_store_root_is_replaced(self):
+        self.check("W0")
+
+
+# Set STARTED before this source. Says it started, then sleeps through most of its cycle.
+SLEEPY_CLIENT = r"""
+import time
+open(STARTED, "w").close()
+time.sleep(3)
+"""
+
+
+def processes_with(*needles: str) -> list[int]:
+    """Pids of the running processes (zombies excluded: empty cmdline) whose command line
+    contains any of `needles`."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        text = cmdline.replace(b"\0", b" ").decode("utf-8", errors="replace")
+        if cmdline and any(n in text for n in needles):
+            found.append(int(entry.name))
+    return found
+
+
+def _default_stop_signals() -> None:  # in the kit's child: as from a shell, not ignored
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_DFL)
+
+
+@unittest.skipUnless(HAVE_TREE and Path("/proc").is_dir(), f"needs /proc and the upstream tree at {TREE}")
+class ParentSignalled(unittest.TestCase):
+    """v0.2.4 C12: SIGTERM or SIGHUP to `run` while a client cycle runs: the parent stops the
+    worker (which ends after its cycle, the client's group killed), removes its temp dirs,
+    writes the report as a setup error and ends by that signal; nothing outlives it."""
+
+    # Seconds the parent may take after the signal (getattr: the module also loads on a kit
+    # without the constant, so such a kit fails these tests rather than the import).
+    BOUND = getattr(cli, "WORKER_STOP_GRACE", 45) + 15
+
+    def check(self, signum: int) -> None:
+        name = signal.Signals(signum).name
+        base = Path(tempfile.mkdtemp(prefix="consumer-lab-psig-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        kit_tmp = base / "tmp"  # the kit's TMPDIR: its workdir and output dir go here
+        kit_tmp.mkdir()
+        files = base / "files"
+        files.mkdir()
+        marker = f"consumer-lab-psig-marker-{os.getpid()}-{name}"
+        started = files / "started"
+        script = files / "client.py"
+        script.write_text(f"STARTED = {str(started)!r}\n" + SLEEPY_CLIENT)
+        out = files / "report.json"
+        cmd = [sys.executable, "-B", "-m", "consumer_lab", "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script} {marker}", "--scenario", "W0", "--json", str(out)]
+        proc = subprocess.Popen(cmd, cwd=REPO, env={**os.environ, "TMPDIR": str(kit_tmp)},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True, preexec_fn=_default_stop_signals)
+        self.addCleanup(lambda: proc.poll() is None and kill_quietly(proc.pid))
+        deadline = time.monotonic() + 60
+        while not started.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(started.exists(), "the client never started")
+        os.kill(proc.pid, signum)
+        sent = time.monotonic()
+        try:
+            stdout, stderr = proc.communicate(timeout=self.BOUND)
+        except subprocess.TimeoutExpired:
+            kill_quietly(proc.pid)
+            stdout, stderr = proc.communicate()
+        took = time.monotonic() - sent
+        output = (stdout + stderr).decode("utf-8", errors="replace")
+        remaining = processes_with(str(kit_tmp), marker)
+        deadline = time.monotonic() + 2.0
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.05)
+            remaining = processes_with(str(kit_tmp), marker)
+        for pid in remaining:  # never leave one behind
+            self.addCleanup(kill_quietly, pid)
+        detail = f"{output}\nafter {took:.1f}s; still running: {remaining}"
+        self.assertEqual(proc.returncode, -signum, detail)
+        self.assertLess(took, self.BOUND, detail)
+        self.assertEqual(remaining, [], detail)
+        self.assertEqual(sorted(p.name for p in kit_tmp.iterdir() if p.name.startswith("consumer-lab")), [], detail)
+        self.assertTrue(out.exists(), detail)
+        report = json.loads(out.read_text())
+        self.assertEqual(report["setup_error"], f"W0: interrupted by {name}", detail)
+        self.assertEqual(report["scenarios"], {}, detail)
+        self.assertIn(f"setup error: W0: interrupted by {name}", output.splitlines(), detail)
+
+    def test_sigterm_to_the_parent_cleans_up_and_ends_by_sigterm(self):
+        self.check(signal.SIGTERM)
+
+    def test_sighup_to_the_parent_cleans_up_and_ends_by_sighup(self):
+        self.check(signal.SIGHUP)
 
 
 SIGTERM_CLIENT = r"""
@@ -1022,6 +1179,146 @@ class KitThreadsBlockTheDeferredSignals(unittest.TestCase):
 
     def test_writer_worker_threads_block_the_deferred_signals(self):
         self.check("W0", 2)  # at least the upstream and fault-proxy threads
+
+
+
+@unittest.skipUnless(hasattr(os, "pidfd_open") and Path("/proc").is_dir(), "needs pidfd_open and /proc")
+class WorkerStopperReapedMeanwhile(unittest.TestCase):
+    """v0.2.4 C12 fix round 1: when the worker is gone on the stopper's re-check (reaped, the pid
+    maybe reused, between the scan and pidfd_open), the stopper signals nothing and closes its
+    pidfd exactly once, with no exception in its thread."""
+
+    def test_pidfd_closed_once_when_the_worker_is_gone_on_the_recheck(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(kill_quietly, child.pid)  # runs first: cleanups run last-in, first-out
+        scans, opened, closed, errors = [], [], [], []
+        real_open, real_close = os.pidfd_open, os.close
+
+        def child_pids():  # the child on the first scan, gone on the re-check
+            scans.append(1)
+            return [child.pid] if len(scans) == 1 else []
+
+        def pidfd_open(pid, *rest):
+            fd = real_open(pid, *rest)
+            opened.append(fd)
+            return fd
+
+        def close(fd):
+            if fd in opened:
+                closed.append(fd)
+            real_close(fd)
+
+        stop = cli._ParentSignals()
+        stop.signum = signal.SIGTERM  # recorded; nothing is installed
+        with mock.patch.object(cli, "_child_pids", child_pids), \
+                mock.patch.object(cli.os, "pidfd_open", pidfd_open), \
+                mock.patch.object(cli.os, "close", close), \
+                mock.patch.object(threading, "excepthook", lambda a: errors.append(repr(a.exc_value))):
+            stopper = cli._WorkerStopper(stop)
+            stopper.start()
+            stopper.join(10)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(scans), 2)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(closed, opened)  # exactly one close, of the pidfd it opened
+        self.assertIsNone(child.poll(), "the child was signalled")
+
+
+class ParentSignalDecidedLate(unittest.TestCase):
+    """v0.2.4 C12 fix round 1, in-process (no upstream, no worker: the tree checks, the worker
+    and `upstream_commit` are patched; `_ParentSignals.end` records instead of ending the
+    process). A signal recorded before a setup error leaves `_run`, or after the scenarios but
+    before the report is written, still gives the report and the lines before the end."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="consumer-lab-plate-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.out = self.base / "report.json"
+        self.err = io.StringIO()
+        self.ends = []  # at each `end`: (stderr so far, the report then, or None)
+        self.signals = []
+        real_install = cli._ParentSignals.install
+
+        def install(signals):
+            self.signals.append(signals)
+            real_install(signals)
+
+        def end(signals):
+            report = json.loads(self.out.read_text()) if self.out.exists() else None
+            self.ends.append((signals.name(), self.err.getvalue(), report))
+
+        for patch in (
+            mock.patch.object(cli, "marker_ok", lambda tree: (True, "")),
+            mock.patch.object(cli, "missing_upstream_api", lambda tree: []),
+            mock.patch.object(cli._ParentSignals, "install", install),
+            mock.patch.object(cli._ParentSignals, "end", end),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def record(self, signum: int) -> None:
+        """What the installed handler does when the signal arrives."""
+        self.signals[0]._handler(signum, None)
+
+    def main(self) -> int:
+        argv = ["run", "--upstream", str(self.base), "--client", "true", "--scenario", "W0",
+                "--json", str(self.out)]
+        with contextlib.redirect_stderr(self.err), contextlib.redirect_stdout(io.StringIO()):
+            return cli.main(argv)
+
+    def test_a_setup_error_after_a_signal_is_printed_and_reported_before_the_end(self):
+        def new_workdir(sid):
+            self.record(signal.SIGTERM)
+            raise cli.SetupError("injected after the signal")
+
+        with mock.patch.object(cli, "_new_workdir", new_workdir):
+            code = self.main()
+        self.assertEqual(code, cli.EXIT_SETUP)
+        self.assertEqual(len(self.ends), 1, self.ends)
+        name, err, report = self.ends[0]
+        self.assertEqual(name, "SIGTERM")
+        lines = err.splitlines()
+        self.assertIn("setup error: injected after the signal", lines, err)
+        self.assertIn("setup error: W0: interrupted by SIGTERM", lines, err)
+        self.assertIsNotNone(report, err)
+        self.assertEqual(report["setup_error"], "W0: interrupted by SIGTERM")
+        self.assertEqual(report["scenarios"], {})
+        self.assertFalse(report["all_pass"])
+        self.assertEqual(sorted(p.name for p in self.base.iterdir()), ["report.json"])
+
+    def test_a_signal_after_the_scenarios_before_the_report_is_reported(self):
+        workdirs = []
+
+        def new_workdir(sid):
+            workdirs.append(Path(tempfile.mkdtemp(prefix="consumer-lab-w0-", dir=self.base)))
+            return workdirs[-1]
+
+        result = {"id": "W0", "name": "seed", "verdict": "PASS", "reason": "ok"}
+
+        def run_worker(cmd, env, stop=None):
+            return 0, json.dumps(result) + "\n", "", 0
+
+        def commit(tree):  # read after the last scenario, before the report is written
+            self.record(signal.SIGHUP)
+            return "unknown"
+
+        with mock.patch.object(cli, "_new_workdir", new_workdir), \
+                mock.patch.object(cli, "_run_worker", run_worker), \
+                mock.patch.object(cli, "upstream_commit", commit):
+            code = self.main()
+        self.assertEqual(code, cli.EXIT_SETUP)
+        self.assertEqual(len(self.ends), 1, self.ends)
+        name, err, report = self.ends[0]
+        self.assertEqual(name, "SIGHUP")
+        self.assertIn("setup error: W0: interrupted by SIGHUP", err.splitlines(), err)
+        self.assertIsNotNone(report, err)
+        self.assertEqual(report["setup_error"], "W0: interrupted by SIGHUP")
+        self.assertEqual(report["scenarios"], {"W0": result})
+        self.assertFalse(report["all_pass"])
+        self.assertEqual(len(workdirs), 1)
+        self.assertEqual(sorted(p.name for p in self.base.iterdir()), ["report.json"])
 
 
 if __name__ == "__main__":

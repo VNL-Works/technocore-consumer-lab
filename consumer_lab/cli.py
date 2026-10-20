@@ -21,6 +21,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -36,6 +38,11 @@ from consumer_lab.server import (
 
 EXIT_PASS, EXIT_FAIL, EXIT_SETUP = 0, 1, 2
 WORKER_TIMEOUT = 600
+# After SIGTERM/SIGHUP to `run`: how long the worker gets to end after its SIGTERM before it is
+# killed. The worker defers that SIGTERM while a client cycle runs (at most CYCLE_TIMEOUT, 30 s),
+# then kills the client's group and ends by it; 30 s plus a margin of 15 s.
+WORKER_STOP_GRACE = 45
+WORKER_POLL = 0.2  # seconds between checks for a parent signal while a worker runs
 OUTPUT_TAIL_BYTES = 1 << 20  # how much of each worker stream the parent reads (the end of it)
 
 
@@ -170,15 +177,15 @@ def _worker(args) -> int:
             raise SetupError(f"temp dir {workdir} is on /mnt/; set TMPDIR to a Linux path")
         root = workdir / "root"
         root.mkdir()
-        workdir_id = workdir_identity(workdir)
+        workdir_id = workdir_identity(workdir)  # the workdir and its root
         up = Upstream(args.upstream, root)
         try:
             kit = Kit(up, args.client, workdir, scenario.room)
             truth = scenario.run(kit)
         finally:
-            # After a replaced workdir, no shutdown hooks: upstream's hook flushes its counters by
-            # path, and the workdir path now leads wherever the client chose. Asked of the dir
-            # itself, not of the exception: a client's SIGINT can end the cycle before the check.
+            # After a replaced workdir or root, no shutdown hooks: upstream's hook flushes its
+            # counters by path, and that path now leads wherever the client chose. Asked of the
+            # dirs themselves, not of the exception: a client's SIGINT can end the cycle first.
             up.stop(shutdown_hooks=workdir_unchanged(workdir, workdir_id))
         cycles = list(kit.cycles)
         if cycles and not kit.log_intact():  # changed after the last cycle ended
@@ -245,14 +252,14 @@ def _writer_worker(args, scenario) -> int:
             raise SetupError(f"temp dir {workdir} is on /mnt/; set TMPDIR to a Linux path")
         root = workdir / "root"
         root.mkdir()
-        workdir_id = workdir_identity(workdir)
+        workdir_id = workdir_identity(workdir)  # the workdir and its root
         up = Upstream(args.upstream, root)
         try:
             run = run_writer(scenario, up, args.client, workdir)
         finally:
-            # After a replaced workdir, no shutdown hooks: upstream's hook flushes its counters by
-            # path, and the workdir path now leads wherever the client chose. Asked of the dir
-            # itself, not of the exception: a client's SIGINT can end the cycle before the check.
+            # After a replaced workdir or root, no shutdown hooks: upstream's hook flushes its
+            # counters by path, and that path now leads wherever the client chose. Asked of the
+            # dirs themselves, not of the exception: a client's SIGINT can end the cycle first.
             up.stop(shutdown_hooks=workdir_unchanged(workdir, workdir_id))
         verdict = judge_write(scenario.id, run.lines, run.truth, run.cycle)
         kinds: Counter[str] = Counter()
@@ -355,9 +362,143 @@ def _tail(f) -> tuple[str, int]:
     return f.read(OUTPUT_TAIL_BYTES).decode("utf-8", errors="replace"), start
 
 
-def _run_worker(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str, int] | None:
+class _ParentSignals:
+    """SIGTERM and SIGHUP to `run`, for the duration of `_run`.
+
+    The handler only records the first one (later ones change nothing), so it never interrupts
+    the kit's own steps or the cleanup. While a worker runs, a `_WorkerStopper` thread acts on it
+    (the worker's own wait stays in `subprocess.run`); `_run` checks `signum` after each worker,
+    between scenarios and once more immediately before the report is written, cleans up, prints
+    its lines, and `end` then ends the process by that signal. A signal
+    whose disposition is SIG_IGN when `_run` starts (under `nohup`, say) stays ignored. Off the
+    main thread nothing is installed (Python handlers run only there)."""
+
+    SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self) -> None:
+        self.signum: int | None = None
+        self._previous: dict[int, object] = {}
+
+    def _handler(self, signum, _frame) -> None:
+        if self.signum is None:
+            self.signum = signum
+
+    def install(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig in self.SIGNALS:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue
+            self._previous[sig] = signal.signal(sig, self._handler)
+
+    def restore(self) -> None:
+        for sig, handler in self._previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        self._previous.clear()
+
+    def installed(self) -> bool:
+        return bool(self._previous)
+
+    def name(self) -> str:
+        return signal.Signals(self.signum).name
+
+    def end(self) -> None:
+        """End this process by the recorded signal, with its default disposition, so the caller
+        sees termination by that signal (after the kit's output is flushed)."""
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        signal.signal(self.signum, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {self.signum})
+        os.kill(os.getpid(), self.signum)
+        os._exit(128 + self.signum)  # not reached: the default action ends the process first
+
+
+def _child_pids() -> list[int]:
+    """This process's children, from /proc (the parent starts no process but the worker)."""
+    me, found = os.getpid(), []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                fields = f.read().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(fields) > 1 and fields[1] == str(me).encode():
+            found.append(int(name))
+    return found
+
+
+class _WorkerStopper(threading.Thread):
+    """Runs beside `subprocess.run` while one worker runs. Once `stop` has recorded a signal it
+    finds the worker (this process's child), sends it SIGTERM (the worker defers that during a
+    client cycle, kills the client's group, then ends by it) and, if `finish` has not been called
+    WORKER_STOP_GRACE seconds later, SIGKILL. The worker is addressed through a pidfd taken while
+    it is an unreaped child, so a signal sent after `subprocess.run` reaped it reaches no other
+    process (without pidfd support, by pid, and only while it is still this process's child)."""
+
+    def __init__(self, stop: _ParentSignals) -> None:
+        super().__init__(name="consumer-lab-worker-stopper", daemon=True)
+        self._signals = stop
+        self._done = False
+
+    def finish(self) -> None:
+        self._done = True
+        self.join()
+
+    def _send(self, pid: int, pidfd: int | None, sig: int) -> None:
+        try:
+            if pidfd is not None:
+                signal.pidfd_send_signal(pidfd, sig)
+            elif pid in _child_pids():
+                os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def run(self) -> None:
+        pid = pidfd = None
+        try:
+            while not self._done and pid is None:
+                if self._signals.signum is not None:
+                    children = _child_pids()
+                    if children:
+                        pid = children[0]
+                        try:
+                            pidfd = os.pidfd_open(pid)
+                        except (AttributeError, OSError):
+                            pidfd = None
+                        if pidfd is not None and pid not in _child_pids():
+                            # Reaped (and maybe reused) meanwhile: not ours. `finally` closes
+                            # the pidfd, once.
+                            return
+                        self._send(pid, pidfd, signal.SIGTERM)
+                        break
+                time.sleep(WORKER_POLL)
+            if pid is None:
+                return
+            kill_at = time.monotonic() + WORKER_STOP_GRACE
+            while not self._done and time.monotonic() < kill_at:
+                time.sleep(WORKER_POLL)
+            if not self._done:
+                self._send(pid, pidfd, signal.SIGKILL)
+        finally:
+            if pidfd is not None:
+                os.close(pidfd)
+
+
+def _run_worker(
+    cmd: list[str], env: dict[str, str], stop: _ParentSignals | None = None
+) -> tuple[int, str, str, int] | None:
     """Run one worker; return (exit code, stdout tail, stderr tail, earlier stderr bytes not
-    read), or None when it did not finish within WORKER_TIMEOUT.
+    read), or None when it did not finish within WORKER_TIMEOUT. A signal `stop` records
+    meanwhile stops the worker (`_WorkerStopper`); the result is then returned as usual.
 
     The client shares the worker's stdout and stderr (it can write to /proc/<ppid>/fd/1 and 2),
     so either may hold anything, of any size. They go to two files in a temp dir of the
@@ -368,10 +509,17 @@ def _run_worker(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str, int
     try:
         with open(os.path.join(out_dir, "stdout"), "a+b") as out, \
                 open(os.path.join(out_dir, "stderr"), "a+b") as err:
+            stopper = None
+            if stop is not None and stop.installed():
+                stopper = _WorkerStopper(stop)
+                stopper.start()
             try:
                 proc = subprocess.run(cmd, env=env, stdout=out, stderr=err, timeout=WORKER_TIMEOUT)
             except subprocess.TimeoutExpired:
                 return None
+            finally:
+                if stopper is not None:
+                    stopper.finish()
             stdout, _ = _tail(out)
             stderr, skipped = _tail(err)
             return proc.returncode, stdout, stderr, skipped
@@ -399,65 +547,115 @@ def _run(args) -> int:
 
     results = {}
     setup_error = None
-    for sid in selected:
-        workdir = _new_workdir(sid)
-        cmd = [sys.executable, "-m", "consumer_lab", "_worker", "--upstream", str(tree),
-               "--client", args.client, "--scenario", sid, "--workdir", str(workdir)]
-        if args.keep_root:
-            cmd.append("--keep-root")
-        ran = _run_worker(cmd, env)
-        if ran is None:
-            setup_error = f"{sid}: worker did not finish within {WORKER_TIMEOUT}s"
-            if args.keep_root:
-                _keep_result_json(workdir, sid, setup_error)
-            else:
-                shutil.rmtree(workdir, ignore_errors=True)
-            break
-        returncode, stdout, stderr, skipped = ran
-        if not args.keep_root:
-            shutil.rmtree(workdir, ignore_errors=True)  # the worker removes it; this is the backstop
-        if skipped:
-            sys.stderr.write(f"[worker stderr: {skipped} earlier bytes not shown]\n")
-        if stderr.strip():
-            sys.stderr.write(stderr if stderr.endswith("\n") else stderr + "\n")  # own lines start fresh
-        if returncode != EXIT_PASS:
-            detail = _worker_failure(returncode, stderr)
-            setup_error = f"{sid}: worker exited {returncode}: {detail}"
-            if args.keep_root and returncode < 0:
-                # Most likely killed before it wrote one; O_EXCL keeps one it did write.
-                own = returncode == -signal.SIGINT  # its `finally` ran and printed `kept`
-                _keep_result_json(workdir, sid, setup_error, worker_wrote_its_own=own)
-            break
-        result = _worker_result(stdout)
-        if result is None:
-            setup_error = f"{sid}: worker printed no valid result"
-            break
-        results[sid] = result
-        print(f"{sid} {result['name']:<26} {result['verdict']:<22} {result['reason']}")
-
-    report = {
-        "kit_version": __version__,
-        "pinned_commit": PINNED_COMMIT,
-        "upstream_commit": upstream_commit(tree),
-        "client": args.client,
-        "scenarios": results,
-        "selected": selected,
-        "setup_error": setup_error,
-        "all_pass": setup_error is None and all(r["verdict"] == "PASS" for r in results.values()),
-    }
-    if args.json_out:
+    stop = _ParentSignals()  # SIGTERM/SIGHUP: stop the worker, clean up, report, end by it
+    stop.install()
+    raised = None  # a SetupError leaving `_run`
+    try:
+        last = selected[0]
         try:
-            Path(args.json_out).expanduser().write_text(
-                json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            raise SetupError(f"--json: cannot write {args.json_out}: {exc.strerror}") from exc
-    if setup_error:
-        print(f"setup error: {setup_error}", file=sys.stderr)
-        return EXIT_SETUP
-    passed = sum(r["verdict"] == "PASS" for r in results.values())
-    print(f"{passed}/{len(results)} PASS (upstream {report['upstream_commit']})")
-    return EXIT_PASS if report["all_pass"] else EXIT_FAIL
+            for sid in selected:
+                last = sid
+                if stop.signum is not None:  # arrived between scenarios
+                    setup_error = f"{sid}: interrupted by {stop.name()}"
+                    break
+                workdir = _new_workdir(sid)
+                cmd = [sys.executable, "-m", "consumer_lab", "_worker", "--upstream", str(tree),
+                       "--client", args.client, "--scenario", sid, "--workdir", str(workdir)]
+                if args.keep_root:
+                    cmd.append("--keep-root")
+                ran = _run_worker(cmd, env, stop)
+                if stop.signum is not None:  # the worker was stopped (or had just ended)
+                    setup_error = f"{sid}: interrupted by {stop.name()}"
+                    if ran is not None:
+                        _echo_worker_stderr(ran[2], ran[3])
+                    if args.keep_root:
+                        # Its `finally` ran (and printed `kept`) unless a signal other than SIGINT
+                        # ended it.
+                        own = ran is not None and (ran[0] >= 0 or ran[0] == -signal.SIGINT)
+                        _keep_result_json(workdir, sid, setup_error, worker_wrote_its_own=own)
+                    else:
+                        shutil.rmtree(workdir, ignore_errors=True)
+                    break
+                if ran is None:
+                    setup_error = f"{sid}: worker did not finish within {WORKER_TIMEOUT}s"
+                    if args.keep_root:
+                        _keep_result_json(workdir, sid, setup_error)
+                    else:
+                        shutil.rmtree(workdir, ignore_errors=True)
+                    break
+                returncode, stdout, stderr, skipped = ran
+                if not args.keep_root:
+                    shutil.rmtree(workdir, ignore_errors=True)  # the worker removes it; this is the backstop
+                _echo_worker_stderr(stderr, skipped)
+                if returncode != EXIT_PASS:
+                    detail = _worker_failure(returncode, stderr)
+                    setup_error = f"{sid}: worker exited {returncode}: {detail}"
+                    if args.keep_root and returncode < 0:
+                        # Most likely killed before it wrote one; O_EXCL keeps one it did write.
+                        own = returncode == -signal.SIGINT  # its `finally` ran and printed `kept`
+                        _keep_result_json(workdir, sid, setup_error, worker_wrote_its_own=own)
+                    break
+                result = _worker_result(stdout)
+                if result is None:
+                    setup_error = f"{sid}: worker printed no valid result"
+                    break
+                results[sid] = result
+                print(f"{sid} {result['name']:<26} {result['verdict']:<22} {result['reason']}")
+        except SetupError as exc:
+            if stop.signum is None:
+                raise
+            # A signal was recorded: this error's line now, then the report as interrupted.
+            print(f"setup error: {exc}", file=sys.stderr)
+            setup_error = f"{last}: interrupted by {stop.name()}"
+
+        upstream = upstream_commit(tree)
+        # The final decision about a recorded signal, immediately before the report is written
+        # (after the last scenario, too). A signal recorded from here on still ends the process
+        # by it, with the report and the lines as written.
+        if setup_error is None and stop.signum is not None:
+            setup_error = f"{last}: interrupted by {stop.name()}"
+        report = {
+            "kit_version": __version__,
+            "pinned_commit": PINNED_COMMIT,
+            "upstream_commit": upstream,
+            "client": args.client,
+            "scenarios": results,
+            "selected": selected,
+            "setup_error": setup_error,
+            "all_pass": setup_error is None and all(r["verdict"] == "PASS" for r in results.values()),
+        }
+        if args.json_out:
+            try:
+                Path(args.json_out).expanduser().write_text(
+                    json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+                )
+            except OSError as exc:
+                error = SetupError(f"--json: cannot write {args.json_out}: {exc.strerror}")
+                if stop.signum is None:
+                    raise error from exc
+                print(f"setup error: {error}", file=sys.stderr)  # this run ends by the signal below
+        if setup_error:
+            print(f"setup error: {setup_error}", file=sys.stderr)
+            return EXIT_SETUP
+        passed = sum(r["verdict"] == "PASS" for r in results.values())
+        print(f"{passed}/{len(results)} PASS (upstream {report['upstream_commit']})")
+        return EXIT_PASS if report["all_pass"] else EXIT_FAIL
+    except SetupError as exc:
+        raised = exc
+        raise
+    finally:
+        stop.restore()
+        if stop.signum is not None:
+            if raised is not None:  # `main` would print it only after this process ended
+                print(f"setup error: {raised}", file=sys.stderr)
+            stop.end()
+
+
+def _echo_worker_stderr(stderr: str, skipped: int) -> None:
+    if skipped:
+        sys.stderr.write(f"[worker stderr: {skipped} earlier bytes not shown]\n")
+    if stderr.strip():
+        sys.stderr.write(stderr if stderr.endswith("\n") else stderr + "\n")  # own lines start fresh
 
 
 def main(argv: list[str] | None = None) -> int:

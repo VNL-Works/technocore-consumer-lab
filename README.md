@@ -128,9 +128,11 @@ and write worker output; SIGKILL, SIGSTOP, fault signals (SEGV, BUS, FPE, ILL, T
 signals reserved by the C library (32 and 33 on glibc) are not deferred and can end or stop the worker
 first. The worker's two stream files can grow on disk without limit during a cycle (only their last
 1 MiB is read; they are removed afterwards). A same-user process can write to the worker's open files
-through `/proc/<pid>/fd` (the worker is not made non-dumpable). A workdir the client replaces by the
-end of a cycle (with a link, say) is detected then (exit 2) unless its signal ends the worker first;
-either way no later kit write goes through it, but store writes during the cycle are not prevented.
+through `/proc/<pid>/fd` (the worker is not made non-dumpable). A workdir (or its `root`) the client
+replaces by the end of a cycle (with a link, say) is detected then (exit 2) unless its signal ends the
+worker first; either way no later kit write goes through it, but store writes caused by the client's
+own requests are not prevented. SIGTERM or SIGHUP to `run` stops the worker, removes the temp dirs,
+writes the report as a setup error and ends `run` by that signal.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
@@ -240,9 +242,9 @@ saying how the run ended. A writer scenario also starts the proxy in that proces
 `127.0.0.1`, whose only outbound connection is to the upstream's loopback URL; the kit seeds the
 room directly, waits for the proxy to go idle after the cycle, and reads the truth in-process.
 The kit makes no outbound connection other than to its own loopback servers. For a client that
-leaves its workdir in place and keeps to the Trust line above, it writes nothing outside the temp
-dir and the output paths you name (see "Not a sandbox" for a replaced workdir), except Python's own
-`consumer_lab/__pycache__` (gitignored); run with `python -B` to avoid even that.
+leaves its workdir and its `root` in place and keeps to the Trust line above, it writes nothing
+outside the temp dir and the output paths you name (see "Not a sandbox" for a replaced workdir),
+except Python's own `consumer_lab/__pycache__` (gitignored); run with `python -B` to avoid even that.
 
 Out of scope: a compaction-during-read race; signed writes, the GET write lane and notes;
 concurrent writers; proxy keep-alive, chunked request bodies (answered 411), TLS and HTTP/2;

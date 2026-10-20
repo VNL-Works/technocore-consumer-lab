@@ -178,13 +178,13 @@ room `lab-w0`..`lab-w7` (not `e-`), one message and **one** client cycle. Before
 kit posts one seed record (`consumer-lab seed`, from `lab`) straight to upstream, not through
 the proxy, keeps the `seq` upstream gave it in the POST response (from then on the seed is the
 record with that `seq`, not any record with the seed text), and checks that the room holds
-exactly that record: the room exists, so a read that follows a redirect reads a real room.
-The client then runs with `TECHNOCORE_URL` pointing at
-the kit's `FaultProxy` (`consumer_lab/proxy.py`), which relays to upstream on loopback and
-applies the scenario's action to the **first** `POST /r/{room}`; every other request passes
-through unless the scenario says otherwise. The proxy matches paths as
-upstream routes them: any `#fragment` dropped (as httptools does), then **percent-decoded**, so
-`/r/lab%2Dw2` and `/r/lab-w2#x` are the room `lab-w2` and get its fault too. The text the client must post is
+exactly that record: the room exists, so a read that follows a redirect reads a real room. The
+client then runs with `TECHNOCORE_URL` pointing at the kit's `FaultProxy`
+(`consumer_lab/proxy.py`), which relays to upstream on loopback and applies the scenario's
+action to the **first** `POST /r/{room}`; every other request passes through unless the
+scenario says otherwise. The proxy matches paths as upstream routes them: any `#fragment`
+dropped (as httptools does), then **percent-decoded**, so `/r/lab%2Dw2` and `/r/lab-w2#x` are
+the room `lab-w2` and get its fault too. The text the client must post is
 `consumer-lab write <id> <16 random hex>`, unique in the room; the kit checks in-process that
 upstream's `clean_text` keeps it unchanged, so `stored` counts what was posted.
 

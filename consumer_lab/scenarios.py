@@ -37,8 +37,10 @@ class NotDeterministic(SetupError):
 
 
 class WorkdirReplaced(SetupError):
-    """The client replaced the scenario's workdir during a cycle (`check_workdir`). The worker
-    then stops upstream without its shutdown hooks, which would write the store by path."""
+    """The client replaced the scenario's workdir or its `root` during a cycle (`check_workdir`).
+    Whether the worker stops upstream without its shutdown hooks (which would write the store by
+    path) is not decided by this exception: the workers' `finally` asks `workdir_unchanged`,
+    whatever ended the run."""
 
 
 @dataclass(frozen=True)
@@ -163,37 +165,54 @@ def client_argv(client_cmd: str) -> list[str]:
     return argv
 
 
-def workdir_identity(workdir: Path) -> tuple[int, int]:
-    """(st_dev, st_ino) of the scenario's workdir itself, never following a link; recorded
-    before the first client cycle. A SetupError if it is not a directory."""
+WorkdirId = tuple[tuple[int, int], tuple[int, int]]
+
+
+def _dir_id(path: Path) -> tuple[int, int]:
+    """(st_dev, st_ino) of the directory `path` itself, never following a link; a SetupError
+    if it is not a directory."""
     try:
-        st = os.lstat(workdir)
+        st = os.lstat(path)
     except OSError as exc:
-        raise SetupError(f"workdir {workdir} cannot be read: {exc.strerror}") from exc
+        raise SetupError(f"workdir {path} cannot be read: {exc.strerror}") from exc
     if not stat.S_ISDIR(st.st_mode):
-        raise SetupError(f"workdir {workdir} is not a directory")
+        raise SetupError(f"workdir {path} is not a directory")
     return st.st_dev, st.st_ino
 
 
-def check_workdir(workdir: Path, identity: tuple[int, int]) -> None:
-    """Right after a client cycle: a SetupError unless `workdir` is still the directory
-    `workdir_identity` recorded (not missing, not a link, same st_dev and st_ino). The client
-    knows the path (from TC_EVENTS) and could rename the dir and leave a link to somewhere else;
-    the store and the kit write by path, so the run stops here (`WorkdirReplaced`). This detects
-    a swap after the cycle; it does not prevent what the store writes there during the cycle."""
-    if not workdir_unchanged(workdir, identity):
-        raise WorkdirReplaced(f"workdir {workdir} was replaced during the client cycle")
-
-
-def workdir_unchanged(workdir: Path, identity: tuple[int, int]) -> bool:
-    """Whether `workdir` is still the directory `workdir_identity` recorded (not missing, not a
-    link, same st_dev and st_ino). Also asked by the worker before it stops upstream, however
-    the run ended: its shutdown hooks write the store by path."""
+def _same_dir(path: Path, identity: tuple[int, int]) -> bool:
     try:
-        st = os.lstat(workdir)
+        st = os.lstat(path)
     except OSError:
         return False
     return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == identity
+
+
+def workdir_identity(workdir: Path) -> WorkdirId:
+    """(st_dev, st_ino) of the scenario's workdir and of its store root `<workdir>/root`, each
+    the directory itself, never following a link; recorded before the first client cycle, after
+    `root` was created. A SetupError if either is not a directory."""
+    return _dir_id(workdir), _dir_id(workdir / "root")
+
+
+def check_workdir(workdir: Path, identity: WorkdirId) -> None:
+    """Right after a client cycle: a SetupError unless `workdir` and `<workdir>/root` are still
+    the directories `workdir_identity` recorded (not missing, not a link, same st_dev and
+    st_ino). The client knows the path (from TC_EVENTS) and could rename either and leave a link
+    to somewhere else; the store and the kit write by path, so the run stops here
+    (`WorkdirReplaced`, naming what was replaced). This detects a swap after the cycle; it does
+    not prevent what the store writes there because of the client's own requests."""
+    if not _same_dir(workdir, identity[0]):
+        raise WorkdirReplaced(f"workdir {workdir} was replaced during the client cycle")
+    if not _same_dir(workdir / "root", identity[1]):
+        raise WorkdirReplaced(f"store root {workdir / 'root'} was replaced during the client cycle")
+
+
+def workdir_unchanged(workdir: Path, identity: WorkdirId) -> bool:
+    """Whether `workdir` and `<workdir>/root` are still the directories `workdir_identity`
+    recorded (not missing, not a link, same st_dev and st_ino). Also asked by the worker before
+    it stops upstream, however the run ended: its shutdown hooks write the store by path."""
+    return _same_dir(workdir, identity[0]) and _same_dir(workdir / "root", identity[1])
 
 
 def client_env(contract: dict[str, str]) -> dict[str, str]:
