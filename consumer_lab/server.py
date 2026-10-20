@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import logging
 import os
 import re
 import sys
@@ -178,7 +179,14 @@ class Upstream:
         self.url = f"http://127.0.0.1:{port}"
         Upstream._active = self
 
-    def stop(self) -> None:
+    def stop(self, shutdown_hooks: bool = True) -> None:
+        """Stop the server and wait for its thread. With `shutdown_hooks=False`, uvicorn's
+        `force_exit`: no wait for open connections and no lifespan shutdown, so upstream's
+        hook (which flushes the store's counters by path) does not run. The lifespan task is
+        then cancelled at its `yield`; uvicorn's traceback for that is not logged."""
+        if not shutdown_hooks:
+            logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+            self._server.force_exit = True
         self._server.should_exit = True
         self._thread.join(timeout=10)
         if Upstream._active is self:

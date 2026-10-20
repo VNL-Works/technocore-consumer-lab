@@ -117,14 +117,20 @@ its reason, and event counts; writer results add `outcome`, `stored`, `other_rec
 non-seed records the client posted) and the proxy's log, whose paths and methods appear only
 in a fixed form (`<other>` for the rest; `raw_path_differs` flags a changed path). For a client whose
 processes all end with its cycle (its group is killed after every cycle, even if the wait raises;
-asynchronous terminating signals to the worker act only after it; stop signals (TSTP, TTIN, TTOU) sent
+asynchronous terminating signals to the worker act only after it (one sent by `tgkill` to a kit
+thread stays blocked there, unhandled); stop signals (TSTP, TTIN, TTOU) sent
 during a cycle are dropped, with a kit line), the report holds no record texts or client strings from
 events, client integers appear in reasons only within 64-bit range (else `a large integer`), and
 `setup_error` holds only kit text; a bad worker result is a setup error (exit 2). Only the last 1 MiB
 of each worker stream is read; kit stderr echoes it. `--keep-root` never writes `result.json` through
 a link or over an existing entry. Not a sandbox (same user): a `setsid` escapee can outlive the run
 and write worker output; SIGKILL, SIGSTOP, fault signals (SEGV, BUS, FPE, ILL, TRAP, ABRT, SYS) and
-signals reserved by the C library (32 on glibc) are not deferred and can end or stop the worker first.
+signals reserved by the C library (32 and 33 on glibc) are not deferred and can end or stop the worker
+first. The worker's two stream files can grow on disk without limit during a cycle (only their last
+1 MiB is read; they are removed afterwards). A same-user process can write to the worker's open files
+through `/proc/<pid>/fd` (the worker is not made non-dumpable). A workdir the client replaces by the
+end of a cycle (with a link, say) is detected then (exit 2) unless its signal ends the worker first;
+either way no later kit write goes through it, but store writes during the cycle are not prevented.
 Kit self-tests: `~/consumer-lab-venv/bin/python -B -m unittest discover -s tests -v`.
 
 ## The client contract (readers, S1..S5)
@@ -233,8 +239,9 @@ events) is deleted afterwards unless you pass `--keep-root`, which also leaves a
 saying how the run ended. A writer scenario also starts the proxy in that process, bound to
 `127.0.0.1`, whose only outbound connection is to the upstream's loopback URL; the kit seeds the
 room directly, waits for the proxy to go idle after the cycle, and reads the truth in-process.
-The kit makes no outbound connection other than to its own loopback servers. It writes nothing
-outside the temp dir and the output paths you name, except Python's own
+The kit makes no outbound connection other than to its own loopback servers. For a client that
+leaves its workdir in place and keeps to the Trust line above, it writes nothing outside the temp
+dir and the output paths you name (see "Not a sandbox" for a replaced workdir), except Python's own
 `consumer_lab/__pycache__` (gitignored); run with `python -B` to avoid even that.
 
 Out of scope: a compaction-during-read race; signed writes, the GET write lane and notes;

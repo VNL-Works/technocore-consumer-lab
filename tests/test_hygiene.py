@@ -18,6 +18,11 @@
   its restored handler once (a KeyboardInterrupt it raises comes after the re-delivery); a
   partial line the client leaves on its worker's stderr never joins a kit line (`kept`, the
   stop-signal line, the parent's lines after its echo).
+- A client that replaces its workdir with a link to an outside dir and exits 0 ends the run
+  with a setup error right after that cycle (reader and writer); the kit creates nothing there,
+  not even upstream's shutdown counter flush, and `--keep-root` writes no result.json there.
+  One that swaps and then SIGINTs its worker (the cycle then ends in KeyboardInterrupt, before
+  the check) ends with the worker's -2, and the kit creates nothing there either.
 """
 
 import contextlib
@@ -375,6 +380,86 @@ class KeptFilesNeverWrittenThroughLinks(unittest.TestCase):
         self.assertEqual(len(set(kept)), 1, output)
         self.assertEqual(lines[at - 2:at], [NOT_WRITING.format(kept[0]), f"kept {kept[0]}"], output)
         self.assertEqual(len(kept), 2, output)  # one from the worker, one from the parent
+
+
+# Set AWAY and OUTSIDE before this source. Renames its workdir to AWAY, puts a link to the dir
+# OUTSIDE in its place, then exits 0 (the worker is not killed: the kit would go on by path).
+SWAP_WORKDIR_THEN_EXIT = r"""
+import os
+workdir = os.path.dirname(os.environ["TC_EVENTS"])
+os.rename(workdir, AWAY)
+os.symlink(OUTSIDE, workdir)
+"""
+
+# Appended to SWAP_WORKDIR_THEN_EXIT: then SIGINT the worker (this client's parent), whose
+# deferred re-delivery after the cycle raises KeyboardInterrupt out of run_client.
+THEN_SIGINT_THE_WORKER = r"""
+import signal
+os.kill(os.getppid(), signal.SIGINT)
+"""
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class WorkdirReplacedDuringACycle(unittest.TestCase):
+    """A client that swaps its workdir for a link to an outside dir and exits 0 ends the run
+    with a setup error right after that cycle, and the kit creates nothing in the outside dir
+    (no root/, root/.counters, root/.counters.lock, events.jsonl, state/, client.stderr,
+    result.json: its listing at every depth must stay empty)."""
+
+    def check(self, scenario: str, *extra: str, sigint: bool = False) -> str:
+        tmp = Path(tempfile.mkdtemp(prefix="consumer-lab-wclient-"))
+        self.addCleanup(shutil.rmtree, tmp, True)  # holds AWAY (the renamed workdir) and OUTSIDE
+        outside = tmp / "outside"
+        outside.mkdir()
+        away = tmp / "away"
+        script = tmp / "client.py"
+        source = f"AWAY = {str(away)!r}\nOUTSIDE = {str(outside)!r}\n" + SWAP_WORKDIR_THEN_EXIT
+        script.write_text(source + (THEN_SIGINT_THE_WORKER if sigint else ""))
+        out = tmp / "report.json"
+        pattern = f"consumer-lab-{scenario.lower()}-*"
+        before = {p.name for p in Path(tempfile.gettempdir()).glob(pattern)}
+        cmd = [sys.executable, "-m", "consumer_lab", "run", "--upstream", str(TREE),
+               "--client", f"{sys.executable} -B {script}", "--scenario", scenario, "--json", str(out),
+               *extra]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=300)
+        left = sorted({p.name for p in Path(tempfile.gettempdir()).glob(pattern)} - before)
+        for name in left:  # the link the client left at the workdir path; never its target
+            self.addCleanup(remove_entry, Path(tempfile.gettempdir()) / name)
+        listing = sorted(str(p.relative_to(outside)) for p in outside.rglob("*"))
+        output = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        detail = f"{output}\noutside dir holds: {listing}"
+        self.assertEqual(listing, [], detail)  # nothing created through the link, at any depth
+        self.assertTrue(away.is_dir(), detail)  # the swap did happen
+        self.assertEqual(proc.returncode, 2, detail)
+        self.assertEqual(len(left), 1, detail)
+        workdir = Path(tempfile.gettempdir()) / left[0]
+        self.assertTrue(workdir.is_symlink(), detail)
+        self.assertEqual(os.readlink(workdir), str(outside), detail)
+        report = json.loads(out.read_text())
+        if sigint:  # the check never ran: the worker ended on the client's signal
+            expected = f"{scenario}: worker exited -2: killed by signal 2"
+        else:
+            expected = f"{scenario}: worker exited 2: workdir {workdir} was replaced during the client cycle"
+        self.assertEqual(report["setup_error"], expected, detail)
+        return output
+
+    def test_reader_stops_when_the_workdir_is_replaced(self):
+        self.check("S1")
+
+    def test_writer_stops_when_the_workdir_is_replaced(self):
+        self.check("W0")
+
+    def test_keep_root_writes_no_result_json_into_a_replaced_workdir(self):
+        output = self.check("W0", "--keep-root")  # the outside dir stays empty: no result.json
+        kept = [ln.removeprefix("kept ") for ln in output.splitlines() if ln.startswith("kept ")]
+        self.assertEqual(len(kept), 1, output)  # the worker's own; the parent writes none on exit 2
+        self.assertIn(NOT_WRITING.format(kept[0]), output.splitlines())
+
+    def test_reader_sigint_after_the_swap_creates_nothing_outside(self):
+        self.check("S1", sigint=True)
+
+    def test_writer_sigint_after_the_swap_creates_nothing_outside(self):
+        self.check("W0", sigint=True)
 
 
 SIGTERM_CLIENT = r"""

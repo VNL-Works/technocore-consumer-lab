@@ -27,8 +27,10 @@ from consumer_lab.scenarios import (
     CYCLE_TIMEOUT,
     NotDeterministic,
     client_argv,
+    check_workdir,
     client_env,
     run_client,
+    workdir_identity,
 )
 from consumer_lab.server import Upstream
 from consumer_lab.writer_judge import WriteTruth, parse_write_events
@@ -210,6 +212,7 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
     # The upstream sweep must store this text unchanged, or `stored` would count nothing.
     _require(up.store.clean_text(text) == text, room, "upstream clean_text keeps the write text unchanged")
 
+    workdir_id = workdir_identity(workdir)  # checked right after the client cycle
     state_dir = workdir / "state"
     state_dir.mkdir()
     events_path = workdir / "events.jsonl"
@@ -235,6 +238,7 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
             }
         )
         exit_code, timed_out = run_client(argv, env, stderr_path, CYCLE_TIMEOUT)
+        check_workdir(workdir, workdir_id)  # before anything else touches it
         at_end = _read_events(events_path)
         n_lines = len(at_end.splitlines())
         # A forward still running would be missed by the count below: wait for the proxy.

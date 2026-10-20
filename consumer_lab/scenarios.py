@@ -36,6 +36,11 @@ class NotDeterministic(SetupError):
     """A scenario precondition did not hold in store state: the run proves nothing."""
 
 
+class WorkdirReplaced(SetupError):
+    """The client replaced the scenario's workdir during a cycle (`check_workdir`). The worker
+    then stops upstream without its shutdown hooks, which would write the store by path."""
+
+
 @dataclass(frozen=True)
 class Scenario:
     id: str
@@ -49,6 +54,8 @@ class Kit:
     """What a scenario gets: the live upstream, HTTP writes, and client cycles."""
 
     def __init__(self, up: Upstream, client_cmd: str, workdir: Path, room: str, cycle_timeout: float = CYCLE_TIMEOUT):
+        self.workdir = workdir
+        self._workdir_id = workdir_identity(workdir)  # checked after every client cycle
         self.up = up
         self.store = up.store
         self.root = up.root
@@ -98,6 +105,7 @@ class Kit:
             }
         )
         exit_code, timed_out = run_client(self.client_argv, env, self.stderr_path, self.cycle_timeout)
+        check_workdir(self.workdir, self._workdir_id)  # before anything else touches it
         after = self.events_path.read_bytes()
         # Append-only: what the log held before this cycle must still be its prefix, byte for
         # byte. (A rewrite to identical bytes is indistinguishable from an append, and harmless.)
@@ -153,6 +161,39 @@ def client_argv(client_cmd: str) -> list[str]:
     if not argv:
         raise SetupError("empty --client command")
     return argv
+
+
+def workdir_identity(workdir: Path) -> tuple[int, int]:
+    """(st_dev, st_ino) of the scenario's workdir itself, never following a link; recorded
+    before the first client cycle. A SetupError if it is not a directory."""
+    try:
+        st = os.lstat(workdir)
+    except OSError as exc:
+        raise SetupError(f"workdir {workdir} cannot be read: {exc.strerror}") from exc
+    if not stat.S_ISDIR(st.st_mode):
+        raise SetupError(f"workdir {workdir} is not a directory")
+    return st.st_dev, st.st_ino
+
+
+def check_workdir(workdir: Path, identity: tuple[int, int]) -> None:
+    """Right after a client cycle: a SetupError unless `workdir` is still the directory
+    `workdir_identity` recorded (not missing, not a link, same st_dev and st_ino). The client
+    knows the path (from TC_EVENTS) and could rename the dir and leave a link to somewhere else;
+    the store and the kit write by path, so the run stops here (`WorkdirReplaced`). This detects
+    a swap after the cycle; it does not prevent what the store writes there during the cycle."""
+    if not workdir_unchanged(workdir, identity):
+        raise WorkdirReplaced(f"workdir {workdir} was replaced during the client cycle")
+
+
+def workdir_unchanged(workdir: Path, identity: tuple[int, int]) -> bool:
+    """Whether `workdir` is still the directory `workdir_identity` recorded (not missing, not a
+    link, same st_dev and st_ino). Also asked by the worker before it stops upstream, however
+    the run ended: its shutdown hooks write the store by path."""
+    try:
+        st = os.lstat(workdir)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == identity
 
 
 def client_env(contract: dict[str, str]) -> dict[str, str]:
@@ -241,7 +282,7 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
     process ends as it would have, but only after the client's group is dead. A recorded stop
     signal (`STOP_SIGNALS`) is dropped, with a kit line on stderr naming it. Not deferred:
     SIGKILL and SIGSTOP, which cannot be caught; the fault signals SIGSEGV, SIGBUS, SIGFPE,
-    SIGILL, SIGTRAP, SIGABRT and SIGSYS; and the signals reserved by the C library (32 on
+    SIGILL, SIGTRAP, SIGABRT and SIGSYS; and the signals reserved by the C library (32 and 33 on
     glibc), which refuse a handler (`UNDEFERRABLE`). A client that sends one of those can
     still end (or stop) this worker before the kill and leave its group alive.
     Must run on the main thread (Python handlers are set and run there), else a SetupError.
@@ -260,7 +301,7 @@ def run_client(argv: list[str], env: dict[str, str], stderr_path: Path, timeout:
             except OSError as exc:
                 if exc.errno != errno.EINVAL:
                     raise SetupError(f"cannot defer signal {sig}: {exc.strerror}") from exc
-                UNDEFERRABLE.add(sig)  # reserved by the C library (32 on glibc)
+                UNDEFERRABLE.add(sig)  # reserved by the C library (32 and 33 on glibc)
         try:
             with open(stderr_path, "ab") as stderr:
                 proc = subprocess.Popen(

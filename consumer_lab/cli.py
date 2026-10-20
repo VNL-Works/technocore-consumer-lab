@@ -148,7 +148,7 @@ def _print_result(result: dict) -> None:
 def _worker(args) -> int:
     """Run one scenario in this process; print one JSON line with the result."""
     from consumer_lab.judge import judge
-    from consumer_lab.scenarios import SCENARIOS, Kit, start_fresh_stderr_line
+    from consumer_lab.scenarios import SCENARIOS, Kit, start_fresh_stderr_line, workdir_identity, workdir_unchanged
     from consumer_lab.server import Upstream
     from consumer_lab.writers import WRITER_SCENARIOS
 
@@ -170,12 +170,16 @@ def _worker(args) -> int:
             raise SetupError(f"temp dir {workdir} is on /mnt/; set TMPDIR to a Linux path")
         root = workdir / "root"
         root.mkdir()
+        workdir_id = workdir_identity(workdir)
         up = Upstream(args.upstream, root)
         try:
             kit = Kit(up, args.client, workdir, scenario.room)
             truth = scenario.run(kit)
         finally:
-            up.stop()
+            # After a replaced workdir, no shutdown hooks: upstream's hook flushes its counters by
+            # path, and the workdir path now leads wherever the client chose. Asked of the dir
+            # itself, not of the exception: a client's SIGINT can end the cycle before the check.
+            up.stop(shutdown_hooks=workdir_unchanged(workdir, workdir_id))
         cycles = list(kit.cycles)
         if cycles and not kit.log_intact():  # changed after the last cycle ended
             cycles[-1] = replace(cycles[-1], log_intact=False)
@@ -223,7 +227,7 @@ def _worker(args) -> int:
 
 def _writer_worker(args, scenario) -> int:
     """The writer twin of `_worker`: one scenario, one client cycle through the proxy."""
-    from consumer_lab.scenarios import start_fresh_stderr_line
+    from consumer_lab.scenarios import start_fresh_stderr_line, workdir_identity, workdir_unchanged
     from consumer_lab.server import Upstream
     from consumer_lab.writer_judge import judge_write
     from consumer_lab.writers import run_writer
@@ -241,11 +245,15 @@ def _writer_worker(args, scenario) -> int:
             raise SetupError(f"temp dir {workdir} is on /mnt/; set TMPDIR to a Linux path")
         root = workdir / "root"
         root.mkdir()
+        workdir_id = workdir_identity(workdir)
         up = Upstream(args.upstream, root)
         try:
             run = run_writer(scenario, up, args.client, workdir)
         finally:
-            up.stop()
+            # After a replaced workdir, no shutdown hooks: upstream's hook flushes its counters by
+            # path, and the workdir path now leads wherever the client chose. Asked of the dir
+            # itself, not of the exception: a client's SIGINT can end the cycle before the check.
+            up.stop(shutdown_hooks=workdir_unchanged(workdir, workdir_id))
         verdict = judge_write(scenario.id, run.lines, run.truth, run.cycle)
         kinds: Counter[str] = Counter()
         for line in run.lines:
