@@ -616,6 +616,61 @@ class WriterKitV024(unittest.TestCase):
         self.assertLess(rss_mib, PARENT_RSS_BOUND_MIB, output[-2000:])
 
 
+SEED_REPOST = r'''
+import json, os, urllib.request
+# A W0 writer that may post the seed text once more before its own write (MODE, set above):
+# "read" takes the seed record's text from the room, "literal" posts the literal seed text
+# without reading, "none" posts nothing extra (the control). Then it posts its write once and
+# reports it confirmed, which is true on the clean path.
+base = os.environ["TECHNOCORE_URL"] + "/r/" + os.environ["TC_ROOM"]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+timeout = float(os.environ["TC_WRITE_TIMEOUT"])
+
+def post(text):
+    body = json.dumps({"from": os.environ["TC_WRITE_FROM"], "text": text}).encode()
+    req = urllib.request.Request(base + "?format=json", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with opener.open(req, timeout=timeout) as resp:
+        resp.read()
+
+if MODE == "read":
+    with opener.open(base + "?format=json", timeout=timeout) as resp:
+        messages = json.loads(resp.read())["messages"]
+    assert len(messages) == 1, messages  # the kit's seed, and nothing else yet
+    post(messages[0]["text"])
+elif MODE == "literal":
+    post("consumer-lab seed")
+post(os.environ["TC_WRITE_TEXT"])
+with open(os.environ["TC_EVENTS"], "a") as f:
+    f.write(json.dumps({"event": "write", "id": os.environ["TC_WRITE_ID"], "outcome": "confirmed"}) + "\n")
+'''
+
+
+@unittest.skipUnless(HAVE_TREE, f"no upstream tree at {TREE}: run scripts/setup_wsl.sh first")
+class SeedRepost(unittest.TestCase):
+    # The kit identifies its seed by the seq upstream gave it, so a client that posts the seed
+    # text again has posted another record: a verdict (exit 1), not a setup error (exit 2).
+
+    def check(self, mode: str, verdict: str, other_records: int) -> None:
+        code, report, output = run_script(f"MODE = {mode!r}\n" + SEED_REPOST, "W0")
+        self.assertIsNotNone(report, output)
+        self.assertIsNone(report["setup_error"], output)
+        self.assertNotIn("the seed is stored exactly once", output)
+        self.assertEqual(verdicts(report), {"W0": verdict}, output)
+        r = report["scenarios"]["W0"]
+        self.assertEqual((r["stored"], r["other_records"], r["outcome"]), (1, other_records, "confirmed"), output)
+        self.assertEqual(code, 0 if verdict == "PASS" else 1, output)
+
+    def test_reposting_the_seed_read_from_the_room_is_an_extra_post(self):
+        self.check("read", "FAIL:extra_post", 1)
+
+    def test_posting_the_literal_seed_text_is_an_extra_post(self):
+        self.check("literal", "FAIL:extra_post", 1)
+
+    def test_the_same_client_without_the_repost_passes(self):
+        self.check("none", "PASS", 0)
+
+
 class ReportLog(unittest.TestCase):
     """`writers.report_entry` on synthetic proxy log entries; no upstream needed."""
 

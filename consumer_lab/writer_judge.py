@@ -47,8 +47,8 @@ class WriteTruth:
 
     `stored`: records in the room whose `text` equals the text the client was given (the
     kit's seed never counts). `other_records`: every other non-seed record in the room (a
-    retry with an altered text, any other post). `proxy_log`: what the proxy did with each
-    request, as reported (see `writers.report_log`).
+    retry with an altered text, a re-posted seed text, any other post). `proxy_log`: what
+    the proxy did with each request, as reported (see `writers.report_log`).
     """
 
     scenario: str

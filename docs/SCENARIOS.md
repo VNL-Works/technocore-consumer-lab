@@ -176,8 +176,10 @@ finally a loss event where nothing was lost (`FAIL:bad_events`). Otherwise `PASS
 Each writer scenario runs in a fresh worker process like a reader scenario, with a fresh plain
 room `lab-w0`..`lab-w7` (not `e-`), one message and **one** client cycle. Before the cycle the
 kit posts one seed record (`consumer-lab seed`, from `lab`) straight to upstream, not through
-the proxy, and checks that the room holds exactly that record: the room exists, so a read that
-follows a redirect reads a real room. The client then runs with `TECHNOCORE_URL` pointing at
+the proxy, keeps the `seq` upstream gave it in the POST response (from then on the seed is the
+record with that `seq`, not any record with the seed text), and checks that the room holds
+exactly that record: the room exists, so a read that follows a redirect reads a real room.
+The client then runs with `TECHNOCORE_URL` pointing at
 the kit's `FaultProxy` (`consumer_lab/proxy.py`), which relays to upstream on loopback and
 applies the scenario's action to the **first** `POST /r/{room}`; every other request passes
 through unless the scenario says otherwise. The proxy matches paths as
@@ -192,9 +194,13 @@ whose `text` equals the write text, with `store.read_messages(root, room, limit=
 in-process, never through the proxy. Upstream trims the text, so a copy posted with extra
 surrounding whitespace still counts; a retry that **alters** the text (a suffix, a counter) is a
 different message and is not counted as a second copy. The same read gives `other_records`:
-every non-seed record in the room whose text is not the write text (an altered retry, any other
-post); a read that returns `MAX_LIMIT` records or more is a setup error, as it may be cut off.
-The seed never counts and must still be there exactly once. After the proxy has stopped, the
+every non-seed record in the room whose text is not the write text (an altered retry, a
+re-posted seed text, any other post); a read that returns `MAX_LIMIT` records or more is a setup
+error, as it may be cut off. The seed never counts: the record with the seed's `seq` must still be
+there, exactly once and with the seed text, or the run is a setup error. A record with the seed
+text under any other `seq` is another record: a client that posts the seed text again (it can
+read it from the room) gets `FAIL:extra_post` unless an earlier rule matches, not a setup
+error. After the proxy has stopped, the
 kit waits for it to go idle once more and requires that no request arrived after its snapshot
 of the log. Each of the two idle waits lasts at most 10 s (`IDLE_TIMEOUT`); if a connection to
 the proxy is still open (not yet closed by the proxy) when a wait ends, for example from a

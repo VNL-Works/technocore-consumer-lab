@@ -5,6 +5,8 @@ the room exists and a read that follows a redirect reads a real room); then one 
 through a `FaultProxy` whose plan injects the fault; then `proxy.wait_idle`, and the truth:
 how many records in the room hold exactly the text the client was given, and how many other
 non-seed records it holds, read in-process with `store.read_messages`, never through the proxy.
+The seed is the record with the `seq` upstream gave the kit's seed POST, not any record with the
+seed text: a client that re-posts the seed text has posted another record.
 The proxy's log goes into the report only through `report_log`, which keeps no client-chosen
 path or method.
 
@@ -93,8 +95,12 @@ def _scenarios() -> dict[str, WriterScenario]:
 WRITER_SCENARIOS: dict[str, WriterScenario] = _scenarios()
 
 
-def _seed(up: Upstream, room: str) -> None:
-    """One record straight to upstream (not through the proxy), so the room exists."""
+def _seed(up: Upstream, room: str) -> int:
+    """One record straight to upstream (not through the proxy), so the room exists.
+
+    Returns the `seq` upstream gave it, from the POST response: the kit tells its seed from
+    every other record by that seq (a client can read the seed text and post it again).
+    """
     body = json.dumps({"from": SEED_FROM, "text": SEED_TEXT}).encode()
     req = urllib.request.Request(
         f"{up.url}/r/{room}?format=json",
@@ -106,9 +112,14 @@ def _seed(up: Upstream, room: str) -> None:
         posted = json.loads(resp.read())["posted"]
     if posted.get("text") != SEED_TEXT:
         raise NotDeterministic(f"{room}: precondition failed: the seed was stored as another text")
+    seq = posted.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        raise NotDeterministic(f"{room}: precondition failed: the seed POST's response carries no integer seq")
+    return seq
 
 
-def _texts(up: Upstream, room: str) -> list[str]:
+def _records(up: Upstream, room: str) -> list[tuple[object, object]]:
+    """`(seq, text)` of every record in the room, in store order."""
     limit = up.store.MAX_LIMIT
     view = up.store.read_messages(up.root, room, limit=limit)
     messages = view["messages"]
@@ -117,7 +128,7 @@ def _texts(up: Upstream, room: str) -> list[str]:
         raise NotDeterministic(
             f"{room}: the room holds too many records to count ({len(messages)} read, limit {limit})"
         )
-    return [m.get("text") for m in messages]
+    return [(m.get("seq"), m.get("text")) for m in messages]
 
 
 REPORT_METHODS = frozenset(("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "?"))
@@ -219,9 +230,9 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
     events_path.touch()
     stderr_path = workdir / "client.stderr"  # kept with --keep-root, for debugging
 
-    _seed(up, room)
-    before = _texts(up, room)
-    _require(before == [SEED_TEXT], room, "the room holds exactly the seed before the cycle")
+    seed_seq = _seed(up, room)
+    before = _records(up, room)
+    _require(before == [(seed_seq, SEED_TEXT)], room, "the room holds exactly the seed before the cycle")
 
     proxy = P.FaultProxy(up.url, scenario.plan)
     try:
@@ -253,10 +264,16 @@ def run_writer(scenario: WriterScenario, up: Upstream, client_cmd: str, workdir:
     # Same entries, now with their final `forwarded` / `origin_status`: use those from here on.
     log = [dict(e) for e in proxy.log]
 
-    texts = _texts(up, room)
-    _require(texts.count(SEED_TEXT) == 1, room, "the seed is stored exactly once")
-    stored = texts.count(text)
-    other_records = len(texts) - 1 - stored  # every non-seed record that is not the write text
+    records = _records(up, room)
+    seed = [t for s, t in records if s == seed_seq]
+    _require(
+        seed == [SEED_TEXT],
+        room,
+        f"the seed record (seq {seed_seq}) is still stored exactly once, with the seed text",
+    )
+    others = [t for s, t in records if s != seed_seq]  # a re-posted seed text is one of these
+    stored = others.count(text)
+    other_records = len(others) - stored  # every non-seed record that is not the write text
     check_fault_applied(scenario, log, stored)
 
     # The log as it stood when the cycle ended is what gets judged. A change made after that
