@@ -52,9 +52,11 @@ The scenarios are built from HTTP writes plus a few **private** functions of ups
 - `read_messages`, `export_room`, `room_generation`, `room_path`: the kit's own truth.
 
 Private names are not an upstream contract. The kit is pinned to upstream commit
-`0e47f770b13cc27e1e2e199d4cdf70a4778c97cc`; at any other commit a scenario may stop meaning
+`4a013e5401f15e56762456d1d48c4e676e2cff2c`; at any other commit a scenario may stop meaning
 what `docs/SCENARIOS.md` says. The kit refuses to start (exit 2) when `src/store.py` lacks
 `def _compact(` or `def _reap_pass(`, or when any function a scenario needs is missing.
+The pin moved from `0e47f77`; `src/*.py`, `uv.lock` and `pyproject.toml` are byte-identical
+between the two (only `src/humans.html`, which the kit does not use, differs).
 It does not vendor upstream: it runs an upstream tree you point it at.
 
 **Other upstream trees.** The kit was also run against two open upstream PRs, #800 (head
@@ -84,12 +86,12 @@ in that light.
 
 ```bash
 # 1. An upstream working tree at the pinned commit, on the Linux filesystem (not /mnt/):
-mkdir -p ~/consumer-lab-upstream-0e47f77
-git -C <technocore-chat clone> archive 0e47f770b13cc27e1e2e199d4cdf70a4778c97cc \
-  | tar -x -C ~/consumer-lab-upstream-0e47f77
+mkdir -p ~/consumer-lab-upstream-4a013e5
+git -C <technocore-chat clone> archive 4a013e5401f15e56762456d1d48c4e676e2cff2c \
+  | tar -x -C ~/consumer-lab-upstream-4a013e5
 
 # 2. The venv (~/consumer-lab-venv) with upstream's locked runtime deps. Network: PyPI only.
-bash scripts/setup_wsl.sh ~/consumer-lab-upstream-0e47f77
+bash scripts/setup_wsl.sh ~/consumer-lab-upstream-4a013e5
 ```
 
 `setup_wsl.sh` uses `python3 -m venv`, installs `uv` from PyPI, installs exactly what
@@ -104,7 +106,7 @@ are unreliable, and the kit refuses a `CHAT_ROOT` under `/mnt/`.
 
 ```bash
 ~/consumer-lab-venv/bin/python -B -m consumer_lab run \
-  --upstream ~/consumer-lab-upstream-0e47f77 \
+  --upstream ~/consumer-lab-upstream-4a013e5 \
   --client "./my-reader --flag" \
   [--scenario S1..S5|all|W0..W7|writers] [--json report.json] [--keep-root]
 ```

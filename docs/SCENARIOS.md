@@ -2,7 +2,7 @@
 
 Reader scenarios S1..S5 come first; the writer scenarios W0..W7 are in
 [Writer scenarios](#writer-scenarios-w0w7) at the end. All five reader scenarios run against the real upstream app at commit
-`0e47f770b13cc27e1e2e199d4cdf70a4778c97cc`, served on `127.0.0.1` from a fresh temp root in a
+`4a013e5401f15e56762456d1d48c4e676e2cff2c`, served on `127.0.0.1` from a fresh temp root in a
 fresh process. Writes go over HTTP (`POST /r/<room>?format=json`). The few non-HTTP steps are
 private `store` calls made in the server's own process, listed per scenario. The kit computes
 the truth from store state it controls (`store.export_room`, `store.read_messages`), and checks

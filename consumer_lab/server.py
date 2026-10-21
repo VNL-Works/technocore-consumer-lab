@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-PINNED_COMMIT = "0e47f770b13cc27e1e2e199d4cdf70a4778c97cc"
+PINNED_COMMIT = "4a013e5401f15e56762456d1d48c4e676e2cff2c"
 MARKER_FILE = ".consumer-lab-upstream"
 
 # Everything the scenarios touch in upstream's src/store.py. Private names are not a

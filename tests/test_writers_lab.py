@@ -4,7 +4,7 @@ The kit's proof that the writer scenarios discriminate: the careful writer must 
 eight, and the naive writer must fail exactly W2, W3, W4, W6 and W7. If the naive writer ever
 passes one of those, that scenario proves nothing: do not weaken the assertion, fix the
 scenario. Needs Linux, the venv from scripts/setup_wsl.sh and the upstream tree
-(CONSUMER_LAB_UPSTREAM, default ~/consumer-lab-upstream-0e47f77); skipped loudly without it.
+(CONSUMER_LAB_UPSTREAM, default ~/consumer-lab-upstream-4a013e5); skipped loudly without it.
 """
 
 import io
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
-TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
+TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-4a013e5")).expanduser()
 HAVE_TREE = (TREE / "src" / "store.py").is_file()
 
 # id: (naive verdict, careful verdict, careful outcome) -- the spec's table, verbatim.
@@ -96,7 +96,7 @@ class ReferenceWriters(unittest.TestCase):
 
     def test_report_shape_and_no_text(self):
         for code, report, output in (self.careful, self.naive):
-            self.assertEqual(report["upstream_commit"], "0e47f770b13cc27e1e2e199d4cdf70a4778c97cc")
+            self.assertEqual(report["upstream_commit"], "4a013e5401f15e56762456d1d48c4e676e2cff2c")
             self.assertEqual(report["selected"], list(TABLE))
             for sid, r in report["scenarios"].items():
                 self.assertEqual(set(r["events"]), {"write", "other", "total"}, sid)

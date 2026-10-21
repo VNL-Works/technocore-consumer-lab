@@ -1,7 +1,7 @@
 """The 5 reader fault scenarios. Each drives one room through HTTP writes plus a few private
 store calls, runs client cycles in between, and returns the truth computed from store state.
 
-Private upstream calls used (pinned at upstream commit 0e47f77; see server.PINNED_COMMIT):
+Private upstream calls used (pinned at upstream commit 4a013e5; see server.PINNED_COMMIT):
 `store._compact` (S2), `store._cutoff` via `store.EPHEMERAL_TTL_SECONDS` (S3, S4),
 `store._reap_pass` with `store.IDLE_SECONDS` (S5), plus the public-but-internal
 `store.export_room`, `store.read_messages`, `store.room_generation`, `store.room_path` for truth.

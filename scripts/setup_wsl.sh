@@ -14,11 +14,14 @@
 # commit is recorded in <upstream-tree>/.consumer-lab-upstream for the JSON report.
 set -euo pipefail
 
-PINNED_COMMIT="0e47f770b13cc27e1e2e199d4cdf70a4778c97cc"
-# sha256 of two files at the pinned commit: the module the scenarios patch, and the lock the
-# deps come from. A git-less tree cannot prove its commit; matching both is the fingerprint.
+PINNED_COMMIT="4a013e5401f15e56762456d1d48c4e676e2cff2c"
+# sha256 of three files at the pinned commit: the module the scenarios patch, the lock the
+# deps come from, and src/humans.html. A git-less tree cannot prove its commit; matching all
+# three is the fingerprint. humans.html is there because store.py and uv.lock are identical at
+# 0e47f77 and 4a013e5: without it a 0e47f77 tree would be recorded as the new pin.
 PINNED_STORE_SHA256="0eee2537081c44d34d34b63feeed89a235853c82764168c364ca14655e437249"
 PINNED_LOCK_SHA256="407cf73389d48a075a2ad6152e63188d8adb0e0281cd769e5bbc159b681dc8a1"
+PINNED_HUMANS_SHA256="b29b2d0e77fc8db975b4ca6389bdc1cdece816abe2084d6c9048f4e639e83025"
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     echo "usage: bash scripts/setup_wsl.sh <upstream-tree> [<upstream-commit>]" >&2
@@ -64,7 +67,12 @@ COMMIT="${2:-}"
 if [ -z "$COMMIT" ]; then
     store_sha="$(sha256sum "$TREE/src/store.py" | cut -d' ' -f1)"
     lock_sha="$(sha256sum "$TREE/uv.lock" | cut -d' ' -f1)"
-    if [ "$store_sha" = "$PINNED_STORE_SHA256" ] && [ "$lock_sha" = "$PINNED_LOCK_SHA256" ]; then
+    humans_sha=""
+    if [ -f "$TREE/src/humans.html" ]; then
+        humans_sha="$(sha256sum "$TREE/src/humans.html" | cut -d' ' -f1)"
+    fi
+    if [ "$store_sha" = "$PINNED_STORE_SHA256" ] && [ "$lock_sha" = "$PINNED_LOCK_SHA256" ] \
+        && [ "$humans_sha" = "$PINNED_HUMANS_SHA256" ]; then
         COMMIT="$PINNED_COMMIT"
     fi
 fi

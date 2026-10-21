@@ -3,7 +3,7 @@
 This is the kit's proof that it discriminates: the careful client must pass everything and
 the naive one must fail the scenarios that lose records. Needs Linux, the venv from
 scripts/setup_wsl.sh, and an upstream tree (CONSUMER_LAB_UPSTREAM, default
-~/consumer-lab-upstream-0e47f77). Skipped, loudly, when the tree is absent.
+~/consumer-lab-upstream-4a013e5). Skipped, loudly, when the tree is absent.
 """
 
 import contextlib
@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
-TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
+TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-4a013e5")).expanduser()
 HAVE_TREE = (TREE / "src" / "store.py").is_file()
 
 
@@ -74,7 +74,7 @@ class ReferenceClients(unittest.TestCase):
 
     def test_report_shape(self):
         report = self.careful[1]
-        self.assertEqual(report["upstream_commit"], "0e47f770b13cc27e1e2e199d4cdf70a4778c97cc")
+        self.assertEqual(report["upstream_commit"], "4a013e5401f15e56762456d1d48c4e676e2cff2c")
         for r in report["scenarios"].values():
             self.assertEqual(set(r["events"]), {"deliver", "loss", "other", "total"})
         text = json.dumps(report)

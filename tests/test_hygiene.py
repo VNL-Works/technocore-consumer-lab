@@ -50,7 +50,7 @@ sys.path.insert(0, str(REPO))
 from consumer_lab import cli  # noqa: E402
 from consumer_lab.scenarios import DEFERRED_SIGNALS, run_client  # noqa: E402
 
-TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
+TREE = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-4a013e5")).expanduser()
 HAVE_TREE = (TREE / "src" / "store.py").is_file()
 
 

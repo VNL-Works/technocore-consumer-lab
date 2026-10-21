@@ -55,7 +55,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-PINNED = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-0e47f77")).expanduser()
+PINNED = Path(os.environ.get("CONSUMER_LAB_UPSTREAM", "~/consumer-lab-upstream-4a013e5")).expanduser()
 PR800 = Path("~/consumer-lab-upstream-pr800-f686ceb").expanduser()
 DEFAULT_VARIANTS = os.pathsep.join([str(PR800), "~/consumer-lab-upstream-pr910-b72607e"])
 VARIANTS = [Path(p).expanduser() for p in os.environ.get("CONSUMER_LAB_VARIANT_UPSTREAMS", DEFAULT_VARIANTS).split(os.pathsep) if p]
@@ -244,8 +244,9 @@ for _name in ("_VariantTree", "_cls", "_tree"):  # the base runs nothing by itse
 @unittest.skipUnless(have_tree(PINNED), f"no upstream tree at {PINNED}: run scripts/setup_wsl.sh first")
 class PinnedTreeContrast(unittest.TestCase):
     def test_empty_window_branch_unreachable_at_pin(self):
-        # At 0e47f77 an empty window reports last_seq = min(since, head), never above the
-        # cursor, so the branch the variant trees exercise cannot run here. This is why
+        # At the pin an empty window reports last_seq = min(since, head), never above the
+        # cursor (store.py is identical at 0e47f77), so the branch the variant trees exercise
+        # cannot run here. This is why
         # test_empty_window_branch_ran needs the other trees.
         code, report, output, events = run_kept("careful_client.py", PINNED)
         self.assertEqual(code, 0, output)
